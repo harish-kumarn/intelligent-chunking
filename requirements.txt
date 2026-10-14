@@ -1,0 +1,29 @@
+# Runtime dependencies — every package here is imported by app/.
+# Versions are the ones the code was verified against.
+
+# --- HTTP layer ---
+fastapi>=0.111,<0.142
+uvicorn[standard]>=0.29,<0.53
+python-multipart>=0.0.9
+
+# --- Configuration ---
+pydantic>=2.7,<3
+pydantic-settings>=2.2,<3
+python-dotenv>=1.0
+PyYAML>=6.0                    # config.yaml (OCR engine switch)
+
+# --- Providers ---
+google-genai>=1.75,<2          # Gemini: vision chunking, auto-grounding
+mistralai>=1.12,<2             # OCR backend: mistral
+azure-ai-documentintelligence>=1.0,<2   # OCR backend: azure (prebuilt-layout → markdown + figures)
+cohere>=5.21,<6                # embeddings + rerank
+groq>=0.37,<1                  # vocabulary dedupe, query reformulation
+boto3>=1.34,<2                 # S3 artifact store
+
+# --- PDF rendering ---
+PyMuPDF>=1.24
+
+# --- Vector store ---
+pymilvus>=2.6,<2.7             # verified against 2.6.14 on Milvus 2.6.24 (run_analyzer, collection properties).
+                               # Server: Milvus 2.6+ — the Japanese (Lindera) analyzer is not in 2.5.x images.
+langchain-core>=0.3,<1         # Document, the chunk hand-off type

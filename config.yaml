@@ -1,0 +1,57 @@
+# ------------------------------------------------------------------------- #
+# config.yaml — pipeline choices that are not secrets.
+#
+# Credentials stay in `.env`; this file only selects *which* provider runs and
+# how it behaves. Every value here is a default: an environment variable of the
+# same name (shown in brackets) always wins, so a container can flip a switch
+# without remounting the file.
+# ------------------------------------------------------------------------- #
+
+ocr:
+  # Which OCR engine stage 1 of the ingestion pipeline uses.  [OCR_TECHNIQUE]
+  #   azure   → Azure AI Document Intelligence  (AZURE_OCR_ENDPOINT + AZURE_OCR_KEY)
+  #   mistral → Mistral OCR                     (MISTRAL_API_KEY)
+  technique: mistral
+
+  azure:
+    # Analysis model. `prebuilt-layout` returns markdown with tables, headings
+    # and figure regions; `prebuilt-read` is cheaper but plain text only.
+    model: prebuilt-layout          # [AZURE_OCR_MODEL]
+    # Crop each detected figure out of the PDF into pdf_images/ and reference
+    # it from the markdown, matching the Mistral path's artifacts.
+    extract_figures: true           # [AZURE_OCR_EXTRACT_FIGURES]
+    # Resolution of those crops.
+    figure_dpi: 200                 # [AZURE_OCR_FIGURE_DPI]
+
+  mistral:
+    model: mistral-ocr-latest       # [MISTRAL_OCR_MODEL]
+
+classification:
+  # Stage 5 of the ingestion pipeline: label every merged chunk with one
+  # main category and zero or more sub categories (Gemini, one call per
+  # chunk). The labels become Milvus filter fields. The `classification`
+  # form field of POST /v1/documents overrides this per request.
+  enabled: true                     # [CLASSIFICATION_ENABLED]
+  # Let the model create a new *main* category when no category below (or
+  # one it already created for the same document) describes a chunk.
+  # Sub categories are always drawn from this list only.
+  allow_new_categories: true        # [CLASSIFICATION_ALLOW_NEW_CATEGORIES]
+  # The general taxonomy: name → definition shown to the model. Names are
+  # normalised to lowercase snake_case. A plain list of names also works.
+  #   [CLASSIFICATION_CATEGORIES='{"safety": "...", ...}']
+  categories:
+    operation: >-
+      Using the product in normal conditions: starting, stopping, controls,
+      settings, operating procedures and handling during work.
+    technical: >-
+      Specifications and how the product is built or works: ratings,
+      dimensions, capacities, components, materials, parts and diagrams.
+    safety: >-
+      Hazards and their prevention: warnings, cautions, protective equipment,
+      safe-use rules, prohibited actions and emergency measures.
+    maintenance: >-
+      Keeping the product in working order: inspection, cleaning, lubrication,
+      adjustment, part replacement, service intervals and storage.
+    troubleshooting: >-
+      Diagnosing and fixing faults: symptoms, probable causes, error codes and
+      corrective actions.

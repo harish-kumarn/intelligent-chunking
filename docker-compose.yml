@@ -1,0 +1,65 @@
+# Vision RAG service + standalone Milvus.
+#
+#   cp .env.example .env        # fill in the provider keys
+#   docker compose up -d --build
+#   curl localhost:8001/v1/health
+#
+# Milvus runs single-container (embedded etcd, local storage) — enough for
+# development and small deployments. The service reaches it over the compose
+# network as `milvus:19530`, which overrides MILVUS_HOST from .env.
+
+services:
+  vision-rag:
+    build: .
+    image: vision-rag
+    container_name: vision-rag
+    env_file: .env
+    environment:
+      MILVUS_HOST: milvus
+      MILVUS_PORT: "19530"
+      INGEST_WORKSPACE_DIR: /srv/ingest_workspace
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./debug:/srv/debug
+      # Ingestion workspaces: a failed or interrupted run resumes from here (also after a restart).
+      - ./ingest_workspace:/srv/ingest_workspace
+      # OCR engine switch — edit config.yaml and restart, no rebuild needed.
+      - ./config.yaml:/srv/config.yaml:ro
+    depends_on:
+      milvus:
+        condition: service_healthy
+    restart: unless-stopped
+
+  milvus:
+    # 2.6+ is required for the Japanese BM25 analyzer (Lindera IPADIC). It runs on its own volume:
+    # 2.6.24 panics ("etcdserver: leader changed") on the 2.5.12 dev volume, so the old
+    # `milvus-data` volume is left untouched as a rollback — see docs/JAPANESE_RETRIEVAL.md.
+    # On first Japanese use Milvus downloads the IPADIC dictionary (~45 MB) into the volume,
+    # so the container needs outbound network access once.
+    image: milvusdb/milvus:v2.6.24
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      DEPLOY_MODE: STANDALONE   # 2.6 refuses embedded etcd without it
+      ETCD_USE_EMBED: "true"
+      ETCD_DATA_DIR: /var/lib/milvus/etcd
+      ETCD_CONFIG_PATH: /milvus/configs/embedEtcd.yaml
+      COMMON_STORAGETYPE: local
+    volumes:
+      - milvus-data-v26:/var/lib/milvus
+      - ./docker/embedEtcd.yaml:/milvus/configs/embedEtcd.yaml:ro
+    ports:
+      # Exposed so local tools (pymilvus, Attu) can reach it from the host.
+      - "${MILVUS_PORT:-19530}:19530"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  milvus-data-v26:

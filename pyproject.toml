@@ -1,0 +1,31 @@
+[project]
+name = "intelligent-chunking"
+version = "0.1.0"
+description = "Vision RAG ingestion + hybrid retrieval service: PDF → OCR → Gemini vision chunking → Milvus (dense + BM25) → Cohere rerank."
+authors = [{ name = "Harish", email = "harish@bluecaffeine.com" }]
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::SyntaxWarning"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501", "B008"]  # B008: FastAPI `Depends(...)` defaults are the framework idiom

@@ -1,0 +1,38 @@
+
+### Resource Directories
+logs/
+intelli_chunk_res/
+chunking_token_usage/
+.env
+/ocr/          # resource dir at the repo root, NOT app/ingestion/ocr/
+*.pdf
+dump/
+*.pyc
+__pycache__/
+debug/
+debug/*
+debug_server/
+debug_server/*
+
+
+### tests
+evaluation/
+tests/
+
+
+### Python Scripts
+
+main_test.py
+dist/
+ic_logs/
+implementation.py
+.pytest_cache
+
+
+### Debugging
+requirements-dev.txt
+
+# Milvus volume backups (docs/JAPANESE_RETRIEVAL.md)
+backup/
+evaluation/.cache/
+ingest_workspace/

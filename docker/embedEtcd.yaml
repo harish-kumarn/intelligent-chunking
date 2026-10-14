@@ -1,0 +1,7 @@
+# Embedded etcd for the single-container Milvus in docker-compose.yml.
+# Milvus segfaults at boot when ETCD_USE_EMBED=true and this file is missing.
+listen-client-urls: http://0.0.0.0:2379
+advertise-client-urls: http://0.0.0.0:2379
+quota-backend-bytes: 4294967296               ### 4 GiB
+auto-compaction-mode: revision
+auto-compaction-retention: '1000'
