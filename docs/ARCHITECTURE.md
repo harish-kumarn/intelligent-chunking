@@ -45,16 +45,18 @@ through `app.api.dependencies`.
 ```mermaid
 flowchart LR
     main --> api --> orchestration --> ingestion
-    api --> retrieval
-    orchestration --> storage
+    api --> retrieval & datasets
+    orchestration --> storage & datasets
     ingestion --> chunking & postprocessing & classification & groundtruth & retrieval
     classification --> postprocessing & chunking
     postprocessing --> chunking
     retrieval --> storage
-    chunking & postprocessing & retrieval & storage & ingestion --> config & logging & utils
+    datasets --> storage
+    chunking & postprocessing & retrieval & storage & ingestion & datasets --> config & logging & observability & utils
 ```
 
-Dependencies only point downward; `config`, `logging`, `utils` depend on nothing in `app`.
+Dependencies only point downward; `config`, `logging`, `utils` depend on nothing in `app`, and `observability`
+only on `logging`.
 
 | Package | Responsibility | Key types |
 |---|---|---|
@@ -66,9 +68,11 @@ Dependencies only point downward; `config`, `logging`, `utils` depend on nothing
 | `app.classification` | main/sub category per merged chunk, general + created category memory | `ClassificationStage`, `CategoryMemory`, `ChunkClassifier` |
 | `app.groundtruth` | optional evaluation Q&A | `AutoGrounder` |
 | `app.retrieval` | Milvus hybrid search, fusion, rerank, reformulation | `EnhancedCohereMilvusRetriever`, `RetrievalConfig`, `fuse` |
-| `app.storage` | content-hash-versioned S3 artifacts | `S3ArtifactStore` |
-| `app.config` | environment-backed settings | `ChunkerConfig`, `ServerSettings` |
+| `app.datasets` | ground-truth dataset contract (`retrieval_v1`), streaming validation, publication, Langfuse mirror — [DATASETS.md](DATASETS.md) | `DatasetService`, `validate_csv`, `SCHEMAS` |
+| `app.storage` | content-hash-versioned S3 artifacts; immutable, content-addressed dataset versions; the one S3 client builder | `S3ArtifactStore`, `S3DatasetStore`, `build_s3_client` |
+| `app.config` | environment-backed settings | `ChunkerConfig`, `ServerSettings`, `AwsCredentials`, `S3ClientOptions` |
 | `app.logging` | console/JSON logging with request context | `configure_logging`, `get_logger`, `in_context` |
+| `app.observability` | module registry, execution context, Langfuse tracing facade — [OBSERVABILITY.md](OBSERVABILITY.md) | `ModuleName`, `SpanName`, `ExecutionContext`, `get_telemetry` |
 | `app.utils` | crash-safe writes, naming, PDF rendering, JSON repair, Gemini client | `atomic_write_json`, `move_file`, `gemini_client` |
 
 ## 3. Ingestion flow
@@ -283,6 +287,15 @@ stateDiagram-v2
 
 `configure_logging` installs one handler set on `vision_rag_api`. Development environments get
 `LEVEL: [MODULE]: message | request_id=… channel=… stage=…`; all others get one JSON object per line
-with the same fields. `request_id` / `document_id` are context variables set per request (and by each job
-thread), and thread-pool tasks run in the submitter's context (`in_context`), so every log line inside a
-pipeline run — page workers included — is attributable without threading identifiers through signatures.
+with the same fields. `request_id` / `document_id` are context variables set per request by
+`RequestContextMiddleware` (and restored by each job thread from the job record), and thread-pool tasks, the
+render thread, S3 uploads and the retriever's executor calls run in the submitter's context (`in_context`), so
+every log line inside a pipeline run — page workers included — is attributable without threading identifiers
+through signatures. Query text is logged at INFO only as a fingerprint.
+
+## 9. Tracing
+
+The same context variables carry the OpenTelemetry span, so Langfuse traces ([OBSERVABILITY.md](OBSERVABILITY.md))
+follow the same propagation: one root trace per workflow run, named by `ModuleName` and tagged with the
+request's `X-Execution-*` context, stage / arm child spans, one generation per chunked page. The facade
+(`app/observability/telemetry.py`) is a no-op when `LANGFUSE_ENABLED=false` and never raises into the run.

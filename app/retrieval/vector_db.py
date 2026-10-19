@@ -31,8 +31,12 @@ and the reranker degrade gracefully (logged, query still answered). A missing co
 a language mismatch or a write to a legacy collection raise app.retrieval.errors types.
 
 Every blocking Milvus / Cohere call on the read path runs on a per-instance
-ThreadPoolExecutor, so `retrieve_async` never blocks the event loop. Instances are safe
-to share across concurrent `retrieve_async` calls; `close()` is idempotent.
+ThreadPoolExecutor (each call bound to the caller's context), so `retrieve_async` never blocks the
+event loop. Instances are safe to share across concurrent `retrieve_async` calls; `close()` is idempotent.
+
+Tracing: `retrieve_async` is one `hybrid_retrieval` trace (strategy, depths, fusion, models; input = the
+query's fingerprint, or its text when `LANGFUSE_CAPTURE_QUERY_TEXT`), with `dense_search` / `bm25_search` /
+`fusion` / `rerank` spans; the output lists the returned chunk ids and scores, never their text.
 """
 
 from __future__ import annotations
@@ -51,6 +55,10 @@ from langchain_core.documents import Document
 from pymilvus import AnnSearchRequest, MilvusClient, RRFRanker, WeightedRanker
 
 from app.config.defaults import ChunkerConfig
+from app.logging.setup import in_context
+from app.observability.modules import ModuleName, SpanName
+from app.observability.sanitize import query_fingerprint
+from app.observability.telemetry import get_telemetry
 from app.retrieval.config import FusionMode, FusionStrategy, RetrievalConfig
 from app.retrieval.embeddings import CohereEmbeddings
 from app.retrieval.errors import CollectionLanguageMismatchError, CollectionNotFoundError, LegacyCollectionError
@@ -162,6 +170,12 @@ class EnhancedCohereMilvusRetriever:
         """The collection's language, or the language it will be created with; None when neither is known."""
         binding = self._binding
         return binding.language if binding else self._write_language
+
+    @property
+    def embedding_model(self) -> Optional[str]:
+        """The model the bound collection was embedded with; None before binding or for injected embeddings."""
+        binding = self._binding
+        return getattr(binding.embeddings, "model", None) if binding else None
 
     # ------------------------------------------------------------------ #
     # Binding to the live collection
@@ -370,32 +384,53 @@ class EnhancedCohereMilvusRetriever:
         if not (query or "").strip():
             raise ValueError("query must not be empty")
         search_query = (reformulated_query or "").strip() or query.strip()
+        reformulated = search_query != query.strip()
+        telemetry = get_telemetry()
+        strategy = "dense" if not cfg.use_hybrid else f"hybrid_{cfg.effective_fusion_mode.value}"
 
         started = time.perf_counter()
-        binding = self._binding or await self._run(self._require_binding)
-        expr = category_filter.expression() if category_filter else ""
-        if expr and binding.layout.is_legacy:
-            raise ValueError(f"Collection '{self.collection_name}' predates classification; category filters are not supported.")
-        fused = await self._search(search_query, cfg, binding, expr)
-        candidates = fused[: cfg.rerank_candidates]
+        with telemetry.trace(
+            ModuleName.HYBRID_RETRIEVAL, input=telemetry.query_input(search_query, reformulated=reformulated),
+            collection_name=self.collection_name, strategy=strategy, fusion_strategy=cfg.fusion_strategy, fusion_mode=cfg.effective_fusion_mode,
+            alpha=cfg.alpha, rrf_k=cfg.rrf_k, top_k=cfg.final_top_k, dense_top_k=cfg.dense_top_k, sparse_top_k=cfg.sparse_top_k,
+            rerank_candidates=cfg.rerank_candidates, use_hybrid=cfg.use_hybrid, use_reranking=cfg.use_reranking,
+            filter_present=bool(category_filter), reformulated=reformulated,
+        ) as trace:
+            binding = self._binding or await self._run(self._require_binding)
+            trace.set(language=binding.language, embedding_model=self.embedding_model, reranking_model=binding.reranker.model)
+            expr = category_filter.expression() if category_filter else ""
+            if expr and binding.layout.is_legacy:
+                raise ValueError(f"Collection '{self.collection_name}' predates classification; category filters are not supported.")
+            fused = await self._search(search_query, cfg, binding, expr)
+            candidates = fused[: cfg.rerank_candidates]
 
-        reranked = False
-        if cfg.use_reranking and binding.reranker.enabled and len(candidates) > 1:
-            reranked_hits = await binding.reranker.rerank_async(
-                query=search_query, docs=candidates, top_k=cfg.rerank_candidates, run_fn=self._run,
+            reranked = False
+            if cfg.use_reranking and binding.reranker.enabled and len(candidates) > 1:
+                with telemetry.span(SpanName.RERANK, model=binding.reranker.model, candidates=len(candidates)) as span:
+                    reranked_hits = await binding.reranker.rerank_async(
+                        query=search_query, docs=candidates, top_k=cfg.rerank_candidates, run_fn=self._run,
+                    )
+                    reranked = reranked_hits is not candidates  # the reranker returns its input on failure
+                    span.set_output(applied=reranked)
+                candidates = reranked_hits
+
+            results = candidates[: cfg.final_top_k]
+            trace.set_output(
+                chunk_ids=[hit["chunk_id"] for hit in results], scores=[hit.get("final_score") for hit in results],
+                result_count=len(results), candidates=len(fused), applied=reranked,
             )
-            reranked = reranked_hits is not candidates  # the reranker returns its input on failure
-            candidates = reranked_hits
-
-        results = candidates[: cfg.final_top_k]
         self._log.info(
             "Retrieved %d/%d hits from '%s' in %dms (language=%s hybrid=%s fusion=%s/%s reranked=%s filter=%s)",
             len(results), len(fused), self.collection_name,
             int((time.perf_counter() - started) * 1000), binding.language,
             cfg.use_hybrid, cfg.effective_fusion_mode.value, cfg.fusion_strategy.value, reranked, expr or "none",
         )
-        if search_query != query.strip():
-            self._log.info("Searched with reformulated query: %r -> %r", query, search_query)
+        if reformulated:  # query text stays out of INFO logs (customer data); fingerprints are enough to correlate
+            self._log.info(
+                "Searched with reformulated query: %s -> %s",
+                query_fingerprint(query)["query_sha256_12"], query_fingerprint(search_query)["query_sha256_12"],
+            )
+            self._log.debug("Reformulated query text: %r -> %r", query, search_query)
         self._log.debug("Final chunk ids: %s", [hit["chunk_id"] for hit in results])
         return results
 
@@ -429,12 +464,16 @@ class EnhancedCohereMilvusRetriever:
             "Arm hits — dense: %s | sparse: %s",
             [h["chunk_id"] for h in dense], [h["chunk_id"] for h in sparse],
         )
-        return fuse(dense, sparse, cfg)
+        with get_telemetry().span(SpanName.FUSION, fusion_strategy=cfg.fusion_strategy, fusion_mode="client", alpha=cfg.alpha, rrf_k=cfg.rrf_k) as span:
+            fused = fuse(dense, sparse, cfg)
+            span.set_output(candidates=len(fused))
+        return fused
 
     async def _run(self, fn: Any, *args: Any) -> Any:
         if self._closed:
             raise RuntimeError("Retriever is closed.")
-        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+        # run_in_executor does not copy contextvars: bind the call so the worker keeps the request's log and trace context.
+        return await asyncio.get_running_loop().run_in_executor(self._executor, in_context(fn), *args)
 
     def _dense_search_params(self, binding: _Binding) -> Dict[str, Any]:
         params = dict(self._cfg.milvus_search_params or {})
@@ -449,36 +488,53 @@ class EnhancedCohereMilvusRetriever:
 
     def _search_dense(self, query: str, cfg: RetrievalConfig, binding: _Binding, expr: str) -> List[Hit]:
         """Primary arm — errors propagate."""
-        results = self._client.search(
-            collection_name=self.collection_name,
-            data=[binding.embeddings.embed_query(query)],
-            anns_field=F_DENSE,
-            search_params=self._dense_search_params(binding),
-            limit=cfg.dense_top_k,
-            output_fields=binding.layout.output_fields,
-            filter=expr,
-        )
-        return [self._to_hit(hit, SOURCE_DENSE, binding) for hit in (results[0] if results else [])]
-
-    def _search_sparse(self, query: str, cfg: RetrievalConfig, binding: _Binding, expr: str) -> List[Hit]:
-        """Secondary arm — degrades to [] on failure."""
-        try:
+        with get_telemetry().span(SpanName.DENSE_SEARCH, top_k=cfg.dense_top_k, filter_present=bool(expr)) as span:
             results = self._client.search(
                 collection_name=self.collection_name,
-                data=[query],
-                anns_field=F_SPARSE,
-                search_params=self._sparse_search_params(cfg),
-                limit=cfg.sparse_top_k,
+                data=[binding.embeddings.embed_query(query)],
+                anns_field=F_DENSE,
+                search_params=self._dense_search_params(binding),
+                limit=cfg.dense_top_k,
                 output_fields=binding.layout.output_fields,
                 filter=expr,
             )
-        except Exception as exc:
-            self._log.error("BM25 search failed on '%s' (%s) — continuing dense-only.", self.collection_name, exc)
-            return []
-        return [self._to_hit(hit, SOURCE_SPARSE, binding) for hit in (results[0] if results else [])]
+            hits = [self._to_hit(hit, SOURCE_DENSE, binding) for hit in (results[0] if results else [])]
+            span.set_output(hits=len(hits))
+        return hits
+
+    def _search_sparse(self, query: str, cfg: RetrievalConfig, binding: _Binding, expr: str) -> List[Hit]:
+        """Secondary arm — degrades to [] on failure."""
+        with get_telemetry().span(SpanName.BM25_SEARCH, top_k=cfg.sparse_top_k, filter_present=bool(expr), language=binding.language) as span:
+            try:
+                results = self._client.search(
+                    collection_name=self.collection_name,
+                    data=[query],
+                    anns_field=F_SPARSE,
+                    search_params=self._sparse_search_params(cfg),
+                    limit=cfg.sparse_top_k,
+                    output_fields=binding.layout.output_fields,
+                    filter=expr,
+                )
+            except Exception as exc:
+                self._log.error("BM25 search failed on '%s' (%s) — continuing dense-only.", self.collection_name, exc)
+                span.record_error(exc)
+                span.set_output(hits=0, degraded=True)
+                return []
+            hits = [self._to_hit(hit, SOURCE_SPARSE, binding) for hit in (results[0] if results else [])]
+            span.set_output(hits=len(hits), degraded=False)
+        return hits
 
     def _search_hybrid_server(self, query: str, cfg: RetrievalConfig, binding: _Binding, expr: str) -> List[Hit]:
         """Single round-trip: Milvus runs both arms and fuses with a native ranker."""
+        with get_telemetry().span(
+            SpanName.FUSION, fusion_strategy=cfg.fusion_strategy, fusion_mode="server", alpha=cfg.alpha, rrf_k=cfg.rrf_k,
+            dense_top_k=cfg.dense_top_k, sparse_top_k=cfg.sparse_top_k, filter_present=bool(expr),
+        ) as span:
+            hits = self._hybrid_server(query, cfg, binding, expr)
+            span.set_output(candidates=len(hits))
+        return hits
+
+    def _hybrid_server(self, query: str, cfg: RetrievalConfig, binding: _Binding, expr: str) -> List[Hit]:
         requests = [
             AnnSearchRequest(
                 data=[binding.embeddings.embed_query(query)],

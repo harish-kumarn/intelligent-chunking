@@ -2,6 +2,7 @@
 app.config.aws
 ==============
 AwsCredentials — static AWS credentials read from the environment / `.env`.
+S3ClientOptions — connect/read timeouts and the retry budget of the S3 clients.
 
 pydantic-settings loads `.env` into *its own* models only; it never exports the
 lines into `os.environ`, so boto3 cannot see `AWS_ACCESS_KEY_ID` written there.
@@ -17,7 +18,22 @@ from typing import Any, Dict, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["AwsCredentials"]
+__all__ = ["AwsCredentials", "S3ClientOptions"]
+
+
+class S3ClientOptions(BaseSettings):
+    """Timeouts and retry budget of every boto3 S3 client the service builds (`app.storage.s3_client`)."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    connect_timeout_seconds: float = Field(default=10.0, gt=0, alias="S3_CONNECT_TIMEOUT_SECONDS")
+    read_timeout_seconds: float = Field(default=60.0, gt=0, alias="S3_READ_TIMEOUT_SECONDS")
+    max_attempts: int = Field(default=5, ge=1, le=20, alias="S3_MAX_ATTEMPTS")  # botocore "standard" retry mode
 
 
 class AwsCredentials(BaseSettings):

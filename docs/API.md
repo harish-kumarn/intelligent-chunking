@@ -8,6 +8,14 @@ Base path `/v1`. All error bodies share one shape:
 
 Pydantic validation failures return FastAPI's standard 422 body.
 
+## Request identity and tracing headers (every route)
+
+Every response carries `X-Request-Id`. Optional request headers declare why a call is made
+([OBSERVABILITY.md](OBSERVABILITY.md#2-execution-context-request-headers)): `X-Execution-Kind`
+(`production` · `ingestion_test` · `retrieval_test` · `evaluation`), `X-Execution-Id`, `X-Dataset-Name`,
+`X-Dataset-Version`, `X-Case-Id` (ids: `^[A-Za-z0-9._:@-]{1,128}$`; an invalid value is **422
+`INVALID_EXECUTION_HEADER`**). When Langfuse tracing is on, a request that opened a trace returns `X-Trace-Id`.
+
 ## Collection names and languages (every route)
 
 **`collection_name` is always given explicitly** — it is required on every ingest route and is never derived
@@ -38,7 +46,9 @@ manual takes hours). Same form fields as below.
 | `GET` | the job; 404 `JOB_NOT_FOUND` — unknown, or finished more than `INGEST_JOB_RETENTION_HOURS` ago. Jobs are recorded on disk, so they survive a restart |
 
 Job: `{job_id, document_id, status: queued|running|succeeded|failed, stage, stage_done, stage_total, progress, stages,
-attempt, max_attempts, created_at, started_at, finished_at, result, error}`. `stage` is one of `ocr` (windows) ·
+attempt, max_attempts, created_at, started_at, finished_at, result, error, execution_id, trace_ids}`. `execution_id`
+is the Langfuse session of the job's traces (`X-Execution-Id` at submit time, else the job id); `trace_ids` holds one
+trace id per attempt (empty when tracing is off). `stage` is one of `ocr` (windows) ·
 `chunk` (pages) · `merge` · `classify` (chunks) · `vocab` · `ground` (pages) · `index` (chunks) · `publish`;
 `progress` (0–1) weights the stages this job runs and never goes backwards. `result` is the `/v1/documents`
 response; `error` is `{code, message, retryable}` — a job's failure is never an HTTP status.
@@ -185,10 +195,17 @@ Run auto-grounding (stage 7) **alone** on a document already published to S3, an
 connection for minutes. Shares the single-flight gate with `/v1/documents`. Needs `GOOGLE_API_KEY`.
 
 The input is the same as for `/v1/documents/from-s3` and is resolved the same way (`merged_chunks.json`, with
-`target_chunks.json` merged as a fallback). Its body needs only `folder_name` (+ optional `s3_bucket` /
-`AWS_DEFAULT_REGION`); other fields are ignored. If the version
+`target_chunks.json` merged as a fallback). Its body needs `folder_name` (+ optional `s3_bucket` /
+`AWS_DEFAULT_REGION`). If the version
 already has a `groundtruth_dataset.json`, it is the starting point: pages already grounded are kept, and
 pages that failed (`error`) or are new are generated. Calling again therefore retries only `failed_pages`.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `publish_dataset` | bool | `false` | also register the CSV as an immutable `hybrid_retrieval` dataset version ([DATASETS.md §5](DATASETS.md#5-auto-grounding--dataset)) |
+| `dataset_name` | str | the document id, lower-cased | `^[a-z][a-z0-9_-]{2,63}$`; required when the document id cannot be one (400) |
+| `promote` | bool | `false` | make that version the dataset's current one |
+| `sync_langfuse` | bool | `false` | mirror it into Langfuse Datasets |
 
 **200**
 
@@ -202,12 +219,36 @@ pages that failed (`error`) or are new are generated. Calling again therefore re
   "question_count": 1180,
   "failed_pages": [57],
   "artifacts": ["operator_manual/versions/9f2c…/groundtruth_dataset.json",
-                "operator_manual/versions/9f2c…/groundtruth_dataset.csv"]
+                "operator_manual/versions/9f2c…/groundtruth_dataset.csv"],
+  "dataset": {"module_name": "hybrid_retrieval", "dataset_name": "operator_manual", "dataset_version": "v-5a0f2e7e645e089d",
+              "created": true, "row_count": 1180, "checksum_sha256": "…", "s3_keys": ["…/dataset.csv", "…/manifest.json"],
+              "promoted": false, "langfuse_sync": null}
 }
 ```
 
-Errors are as for `/v1/documents/from-s3` (400 `S3_BUCKET_REQUIRED`, 404 `S3_DOCUMENT_NOT_FOUND`, 422, 429 `SERVER_BUSY`,
-500 `PROCESSING_FAILED`: a Gemini key problem, or an S3 read/upload failure, in which case the manifest is left unchanged).
+`dataset` is present only with `publish_dataset=true`. Errors are as for `/v1/documents/from-s3` (400 `S3_BUCKET_REQUIRED`,
+404 `S3_DOCUMENT_NOT_FOUND`, 422, 429 `SERVER_BUSY`, 500 `PROCESSING_FAILED`: a Gemini key problem, or an S3 read/upload
+failure, in which case the manifest is left unchanged), plus the dataset errors (422 `DATASET_INVALID`, 409
+`DATASET_VERSION_CONFLICT`, 502 `DATASET_STORE_UNAVAILABLE`) — raised after the groundtruth artifacts were saved.
+
+---
+
+## Datasets — `POST /v1/datasets` · `GET /v1/datasets/{module_name}/{dataset_name}[/versions/{version}]` · `POST …/current`
+
+Versioned ground-truth CSVs in S3 for the evaluation pipeline. Full contract, layout, manifest and error codes:
+[DATASETS.md](DATASETS.md). Upload (multipart): `file`, `module_name` (one of the canonical modules —
+`hybrid_retrieval` is the only one with a schema today), `dataset_name`, `purpose?`, `label?`, `collection_name?`,
+`promote=false`, `verify_references=true`, `sync_langfuse=false`, `s3_bucket?`, `AWS_DEFAULT_REGION?` → **201** with
+`{module_name, dataset_name, dataset_version, created, row_count, checksum_sha256, s3_keys, promoted, langfuse_sync, manifest}`,
+**200** when identical content was already stored (`created: false`).
+
+```bash
+curl -F file=@operator_manual_qa.csv -F module_name=hybrid_retrieval -F dataset_name=operator_manual_qa -F promote=true \
+     localhost:8000/v1/datasets
+curl localhost:8000/v1/datasets/hybrid_retrieval/operator_manual_qa
+curl -H 'Content-Type: application/json' -d '{"dataset_version": "v-5a0f2e7e645e089d"}' \
+     localhost:8000/v1/datasets/hybrid_retrieval/operator_manual_qa/current
+```
 
 ```bash
 curl -H 'Content-Type: application/json' -d '{"folder_name": "operator_manual"}' \

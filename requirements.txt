@@ -18,7 +18,12 @@ mistralai>=1.12,<2             # OCR backend: mistral
 azure-ai-documentintelligence>=1.0,<2   # OCR backend: azure (prebuilt-layout → markdown + figures)
 cohere>=5.21,<6                # embeddings + rerank
 groq>=0.37,<1                  # vocabulary dedupe, query reformulation
-boto3>=1.34,<2                 # S3 artifact store
+boto3>=1.35,<2                 # S3 artifact + dataset stores (datasets need PutObject IfNoneMatch: botocore ≥ 1.35)
+
+# --- Observability ---
+langfuse==5.0.2                # tracing (OpenTelemetry-based v5 API: start_as_current_observation, propagate_attributes,
+                               # create_dataset_item). Exact pin: the facade in app/observability/telemetry.py is written
+                               # against this API; re-verify docs/OBSERVABILITY.md before moving it.
 
 # --- PDF rendering ---
 PyMuPDF>=1.24

@@ -125,13 +125,20 @@ A flat JSON array of unique terms across all chunks, in first-seen order:
 ```json
 {
   "3": {
-    "direct_questions":   [{"question": "…", "answer": "…", "answer_chunk_id": ["page_3_chunk_1"], "tag": "…"}],
+    "direct_questions":   [{"case_id": "operator_manual:3f1c9a0b2e7d", "question": "…", "answer": "…",
+                            "answer_chunk_id": ["page_3_chunk_1"], "tag": "single"}],
     "indirect_questions": [ … ]
   }
 }
 ```
 
-A page whose generation failed every retry is stored with empty lists and an `"error"` string.
+A page whose generation failed every retry is stored with empty lists and an `"error"` string. `case_id` is
+deterministic (`{document_id}:{sha256(page|type|question)[:12]}`); `answer_chunk_id` holds only ids that exist among
+the page's chunks (invented ones are dropped, a question left without one is dropped).
+
+`groundtruth_dataset.csv` is one row per question with the columns
+`case_id, document_id, page, type, tag, answer_chunk_id, question, answer` (`answer_chunk_id` `;`-joined) — the
+`retrieval_v1` dataset format of [DATASETS.md](DATASETS.md), so it can be published as a dataset version as is.
 
 ## Milvus row
 
@@ -176,6 +183,12 @@ by the PDF channel when `S3_UPLOAD_ENABLED=true`, and by `POST /v1/documents/fro
 the collection (`DELETE /v1/collections/{name}`). Document ids never start with `_`, so `_collections/` never
 clashes with a document folder. Query reformulation merges the current `vocab_index.json` of every listed
 document.
+
+```
+_datasets/{module_name}/{dataset_name}/   ground-truth dataset versions (immutable, content-addressed) — see DATASETS.md
+├── current.json
+└── versions/{dataset_version}/{dataset.csv, manifest.json[, langfuse_sync.json]}
+```
 
 ```mermaid
 sequenceDiagram

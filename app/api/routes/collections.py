@@ -47,7 +47,7 @@ async def list_collections(
     base_config: ChunkerConfig = Depends(get_base_config),
     logger: logging.LoggerAdapter = Depends(get_logger),
 ) -> CollectionListResponse:
-    token = request_id_var.set(uuid.uuid4().hex)
+    token = request_id_var.set(request_id_var.get() or uuid.uuid4().hex)  # id from the middleware
     try:
         try:
             names = await run_in_threadpool(_list_collections, base_config)
@@ -77,7 +77,7 @@ async def delete_collection(
     settings: ServerSettings = Depends(get_settings),
     logger: logging.LoggerAdapter = Depends(get_logger),
 ) -> CollectionDeleteResponse:
-    token = request_id_var.set(uuid.uuid4().hex)
+    token = request_id_var.set(request_id_var.get() or uuid.uuid4().hex)  # id from the middleware
     try:
         collection = collection_name
         # Hold the ingestion gate for the drop: a document must not start landing in a

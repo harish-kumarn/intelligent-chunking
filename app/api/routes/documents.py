@@ -75,7 +75,7 @@ async def create_document(
     filename = file.filename or ""
     document_id = document_id_for(filename)
     document_language = _language_or_400(language)
-    tokens = (request_id_var.set(uuid.uuid4().hex), document_id_var.set(document_id))
+    tokens = (request_id_var.set(request_id_var.get() or uuid.uuid4().hex), document_id_var.set(document_id))  # id from the middleware
     staged: Optional[StagedUpload] = None
     try:
         staged = await receive_upload(file, settings)

@@ -15,13 +15,15 @@ from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 from app.retrieval.config import FusionStrategy
 from app.retrieval.filters import normalize_categories
+from app.storage.s3_dataset_store import DATASET_NAME_PATTERN, DATASET_NAME_RULE, DATASET_VERSION_PATTERN
 from app.utils.naming import COLLECTION_NAME_RULE, MAX_CATEGORIES, normalize_collection_name
 
 __all__ = [
-    "CollectionDeleteResponse", "CollectionName", "CollectionListResponse", "DocumentProcessResponse", "ErrorDetail",
-    "ErrorResponse", "HealthResponse", "IngestionJobResponse", "QueryReformulationRequest", "QueryReformulationResponse",
-    "ReadinessResponse", "RetrievalQueryRequest", "RetrievalQueryResponse", "S3DocumentImportRequest", "S3DocumentImportResponse",
-    "S3DocumentRequest",
+    "CollectionDeleteResponse", "CollectionName", "CollectionListResponse", "DatasetInfoResponse", "DatasetName",
+    "DatasetPromoteRequest", "DatasetPromoteResponse", "DatasetUploadResponse", "DatasetVersion", "DatasetVersionResponse",
+    "DatasetVersionSummary", "DocumentProcessResponse", "ErrorDetail", "ErrorResponse", "HealthResponse", "IngestionJobResponse",
+    "QueryReformulationRequest", "QueryReformulationResponse", "ReadinessResponse", "RetrievalQueryRequest",
+    "RetrievalQueryResponse", "S3DocumentImportRequest", "S3DocumentImportResponse", "S3DocumentRequest", "S3GroundingRequest",
     "S3GroundingResponse",
 ]
 
@@ -31,6 +33,28 @@ CollectionName = Annotated[
     AfterValidator(normalize_collection_name),
     Field(description=f"Milvus collection: {COLLECTION_NAME_RULE}; case-insensitive (stored lower-case).", examples=["manuals_en"]),
 ]
+
+
+def normalize_dataset_name(name: str) -> str:
+    """Trimmed and lower-cased, then `DATASET_NAME_PATTERN`; never rewritten into another name."""
+    cleaned = str(name).strip().lower()
+    if not DATASET_NAME_PATTERN.match(cleaned):
+        raise ValueError(f"Invalid dataset name {name!r}: use {DATASET_NAME_RULE} (e.g. 'manuals_en_v2024q3').")
+    return cleaned
+
+
+def _dataset_version(value: str) -> str:
+    cleaned = str(value).strip()
+    if not DATASET_VERSION_PATTERN.match(cleaned):
+        raise ValueError(f"Invalid dataset version {value!r}: expected 'v-' followed by 16 hex characters.")
+    return cleaned
+
+
+DatasetName = Annotated[
+    str, AfterValidator(normalize_dataset_name),
+    Field(description=f"Ground-truth dataset: {DATASET_NAME_RULE}.", examples=["operator_manual_qa"]),
+]
+DatasetVersion = Annotated[str, AfterValidator(_dataset_version), Field(description="Content-addressed version, `v-<16 hex>`.")]
 
 
 def _not_blank(value: str) -> str:
@@ -107,6 +131,28 @@ class S3DocumentImportResponse(BaseModel):
     classified: bool
 
 
+class S3GroundingRequest(S3DocumentRequest):
+    """`POST /v1/documents/from-s3/autogrounding`. With `publish_dataset`, the generated CSV also becomes an
+    immutable `hybrid_retrieval` dataset version (`_datasets/hybrid_retrieval/{dataset_name}/…`, docs/DATASETS.md)."""
+
+    publish_dataset: bool = False
+    dataset_name: Optional[DatasetName] = None      # default: the document id, lower-cased
+    promote: bool = False                           # make the new version the dataset's current one
+    sync_langfuse: bool = False                     # mirror the version into Langfuse Datasets (S3 stays canonical)
+
+
+class DatasetVersionSummary(BaseModel):
+    module_name: str
+    dataset_name: str
+    dataset_version: str                    # `v-` + sha256(canonical csv)[:16]
+    created: bool                           # False: this exact content was already stored (idempotent upload)
+    row_count: int
+    checksum_sha256: str
+    s3_keys: List[str]                      # dataset.csv, manifest.json
+    promoted: bool
+    langfuse_sync: Optional[Dict[str, Any]] = None  # {status: synced|skipped|failed, item_count, …} when requested
+
+
 class S3GroundingResponse(BaseModel):
     """`POST /v1/documents/from-s3/autogrounding`."""
 
@@ -118,6 +164,46 @@ class S3GroundingResponse(BaseModel):
     question_count: int
     failed_pages: List[int]                 # failed every retry; calling again retries only these
     artifacts: List[str]                    # S3 keys written (groundtruth_dataset.json / .csv)
+    dataset: Optional[DatasetVersionSummary] = None   # when `publish_dataset` was set
+
+
+class DatasetUploadResponse(DatasetVersionSummary):
+    """`POST /v1/datasets` — 201 when the version was created, 200 when identical content already existed."""
+
+    manifest: Dict[str, Any]
+
+
+class DatasetInfoResponse(BaseModel):
+    """`GET /v1/datasets/{module_name}/{dataset_name}`."""
+
+    module_name: str
+    dataset_name: str
+    current: Optional[Dict[str, Any]] = None     # current.json: {dataset_version, checksum_sha256, promoted_at}
+    versions: List[Dict[str, Any]]               # every complete version's manifest, newest first
+
+
+class DatasetVersionResponse(BaseModel):
+    module_name: str
+    dataset_name: str
+    dataset_version: str
+    manifest: Dict[str, Any]
+    s3_keys: List[str]
+
+
+class DatasetPromoteRequest(BaseModel):
+    """`POST /v1/datasets/{module_name}/{dataset_name}/current`."""
+
+    dataset_version: DatasetVersion
+    s3_bucket: Optional[str] = None
+    AWS_DEFAULT_REGION: Optional[str] = None
+
+
+class DatasetPromoteResponse(BaseModel):
+    module_name: str
+    dataset_name: str
+    dataset_version: str
+    checksum_sha256: Optional[str] = None
+    promoted_at: str
 
 
 class IngestionJobResponse(BaseModel):
@@ -138,6 +224,8 @@ class IngestionJobResponse(BaseModel):
     finished_at: Optional[str] = None
     result: Optional[DocumentProcessResponse] = None   # when succeeded
     error: Optional[ErrorDetail] = None                # when failed; `retryable` → resubmit resumes the run
+    execution_id: Optional[str] = None       # Langfuse session id of the job's traces (X-Execution-Id, else the job id)
+    trace_ids: List[str] = Field(default_factory=list)  # one Langfuse trace per attempt, in order (empty when tracing is off)
 
 
 class RetrievalQueryRequest(BaseModel):

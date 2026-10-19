@@ -19,8 +19,8 @@ Failure policy: `upload_artifacts` / `publish_version` / `add_version_artifacts`
 `S3PublicationError` and never leave a half-published pointer — a retry either
 re-uploads (no manifest) or refreshes only the files whose sha256 differs (manifest present).
 `cleanup_old_versions` never raises. The current version is never deleted.
-Concurrency: uploads fan out over a bounded thread pool; the boto3 client is
-created lazily and is thread-safe.
+Concurrency: uploads fan out over a bounded thread pool (each task in the caller's context); the boto3
+client (`app.storage.s3_client`: timeouts, standard retries) is created lazily and is thread-safe.
 Credentials: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from the environment or
 `.env` when set (see `app.config.aws`), otherwise boto3's standard chain.
 """
@@ -38,11 +38,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config.aws import AwsCredentials
-from app.logging.setup import get_logger
+from app.logging.setup import get_logger, in_context
+from app.storage.s3_client import build_s3_client
 
 __all__ = [
     "PublishResult", "S3ArtifactError", "S3ArtifactStore", "S3PublicationError", "S3UploadError", "register_in_collection",
@@ -97,6 +97,7 @@ class S3ArtifactStore:
         max_concurrency: int = _DEFAULT_MAX_CONCURRENCY,
         service_version: str = "unknown",
         credentials: Optional[AwsCredentials] = None,
+        client: Any = None,
     ) -> None:
         self._bucket = bucket
         self._region = region
@@ -104,18 +105,21 @@ class S3ArtifactStore:
         self._retention_count = retention_count
         self._max_concurrency = max_concurrency
         self._service_version = service_version
-        self._client: Any = None  # created on first use so constructing a store never touches the network
+        self._client: Any = client  # else created on first use so constructing a store never touches the network
         self._log = get_logger(module="S3_ARTIFACTS")
+
+    @property
+    def bucket(self) -> str:
+        return self._bucket
 
     @property
     def client(self) -> Any:
         if self._client is None:
             credentials = self._credentials or AwsCredentials()
-            region = self._region or credentials.default_region
-            self._client = boto3.client("s3", region_name=region, **credentials.boto_kwargs())
+            self._client = build_s3_client(self._region, credentials)
             self._log.debug(
                 "S3 client ready: bucket=%s region=%s credentials=%s",
-                self._bucket, region, "static" if credentials.is_static else "boto3-chain",
+                self._bucket, self._region or credentials.default_region, "static" if credentials.is_static else "boto3-chain",
             )
         return self._client
 
@@ -217,8 +221,9 @@ class S3ArtifactStore:
         started = time.monotonic()
         uploaded: List[Dict[str, Any]] = []
         failures: List[BaseException] = []
+        upload_one = in_context(self._upload_one)  # workers keep the run's log and trace context
         with ThreadPoolExecutor(max_workers=self._max_concurrency, thread_name_prefix="s3-upload") as pool:
-            futures = {pool.submit(self._upload_one, path, local_dir, prefix): path for path in to_upload}
+            futures = {pool.submit(upload_one, path, local_dir, prefix): path for path in to_upload}
             for future in as_completed(futures):
                 try:
                     uploaded.append({**future.result(), "sha256": digests[futures[future]]})

@@ -33,6 +33,7 @@ from typing import Callable, List, Optional
 import fitz  # PyMuPDF
 
 from app.config.defaults import ChunkerConfig
+from app.logging.setup import in_context
 from app.utils.fs import atomic_write_text
 
 __all__ = ["OcrWindow", "plan_windows", "run_windowed", "shift_pages"]
@@ -103,8 +104,9 @@ def run_windowed(
         if on_progress is not None:
             on_progress(finished, len(windows))
 
+    ocr_window = in_context(ocr)  # workers keep the run's log and trace context
     with ThreadPoolExecutor(max_workers=config.ocr_concurrency, thread_name_prefix="ocr") as pool:
-        futures = [pool.submit(ocr, window) for window in windows]
+        futures = [pool.submit(ocr_window, window) for window in windows]
     for future in futures:
         future.result()  # first failure propagates; finished windows stay for the retry
 

@@ -13,7 +13,8 @@ S3DocumentImporter — index a document already published to S3 into Milvus, wit
 Main path
     import_document ─► load_published_chunks (current version ─► chunks) ─► language ─► index_merged_chunks
 
-`load_published_chunks` is shared with app.orchestration.s3_grounding.
+`load_published_chunks` is shared with app.orchestration.s3_grounding; `published_chunk_ids` wraps it for
+dataset reference checks (app.datasets). Each import is one `s3_reindex` trace.
 
 Apart from the collection registry, nothing is written to S3, and nothing touches the local disk.
 
@@ -27,16 +28,21 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config.defaults import ChunkerConfig
 from app.ingestion.pipeline import index_merged_chunks, resolve_document_language
 from app.logging.setup import get_logger
+from app.observability.modules import ModuleName
+from app.observability.telemetry import get_telemetry
 from app.orchestration.errors import S3DocumentNotFoundError
 from app.postprocessing.merger import MergedChunk, merge_chunks
 from app.storage.s3_artifact_store import S3ArtifactStore, register_in_collection
+from app.storage.s3_dataset_store import DatasetStoreError
 
-__all__ = ["S3DocumentImporter", "S3ImportResult", "load_published_chunks"]
+__all__ = ["S3DocumentImporter", "S3ImportResult", "load_published_chunks", "published_chunk_ids"]
 
 _MERGED_CHUNKS = "merged_chunks.json"
 _TARGET_CHUNKS = "target_chunks.json"
@@ -63,27 +69,36 @@ class S3DocumentImporter:
         self._log = logger or get_logger(module="S3_IMPORT")
 
     def import_document(self, document_id: str, *, collection_name: str, language: Optional[str] = None) -> S3ImportResult:
-        version, merged, source = load_published_chunks(self._store, document_id, self._log)
-        text = "\n".join(str(chunk.get("content") or "") for chunk in merged)
-        document_language = resolve_document_language(text, language, collection_name, config=self._cfg, logger=self._log)
-        self._log.info(
-            "S3 import: document=%s version=%s source=%s chunks=%d language=%s collection=%s",
-            document_id, version, source, len(merged), document_language, collection_name,
-        )
-        index_merged_chunks(
-            merged, collection_name, document_id=document_id, language=document_language, config=self._cfg, logger=self._log,
-        )
-        register_in_collection(self._store, collection_name, document_id, language=document_language, logger=self._log)
-        return S3ImportResult(
-            document_id=document_id,
-            version=version,
-            source_artifact=source,
-            collection_name=collection_name,
-            language=document_language,
-            chunk_count=len(merged),
-            page_count=self._page_count(document_id, version, merged),
-            classified=any("main_category" in chunk for chunk in merged),
-        )
+        with get_telemetry().trace(
+            ModuleName.S3_REINDEX, document_id=document_id, collection_name=collection_name, language_hint=language,
+        ) as trace:
+            version, merged, source = load_published_chunks(self._store, document_id, self._log)
+            trace.set(version=version, source_artifact=source, chunk_count=len(merged))
+            text = "\n".join(str(chunk.get("content") or "") for chunk in merged)
+            document_language = resolve_document_language(text, language, collection_name, config=self._cfg, logger=self._log)
+            self._log.info(
+                "S3 import: document=%s version=%s source=%s chunks=%d language=%s collection=%s",
+                document_id, version, source, len(merged), document_language, collection_name,
+            )
+            index_merged_chunks(
+                merged, collection_name, document_id=document_id, language=document_language, config=self._cfg, logger=self._log,
+            )
+            register_in_collection(self._store, collection_name, document_id, language=document_language, logger=self._log)
+            result = S3ImportResult(
+                document_id=document_id,
+                version=version,
+                source_artifact=source,
+                collection_name=collection_name,
+                language=document_language,
+                chunk_count=len(merged),
+                page_count=self._page_count(document_id, version, merged),
+                classified=any("main_category" in chunk for chunk in merged),
+            )
+            trace.set_output(
+                status="completed", language=result.language, chunk_count=result.chunk_count, page_count=result.page_count,
+                classified=result.classified, uploaded_to_milvus=True,
+            )
+        return result
 
     def _page_count(self, document_id: str, version: str, merged: List[MergedChunk]) -> int:
         """Rendered page images listed in the manifest; else the distinct pages the chunks came from."""
@@ -114,6 +129,24 @@ def load_published_chunks(
     if target:
         return version, merge_chunks(target, logger), _TARGET_CHUNKS
     raise S3DocumentNotFoundError(f"'{document_id}' version {version} has neither {_MERGED_CHUNKS} nor {_TARGET_CHUNKS} with chunks")
+
+
+def published_chunk_ids(store: S3ArtifactStore, logger: logging.LoggerAdapter) -> Callable[[str], Tuple[str, Set[str]]]:
+    """
+    `document_id → (current version, its merged chunk ids)` for dataset reference checks
+    (app.datasets.service.ResolveDocument); LookupError when the document is not published.
+    """
+
+    def resolve(document_id: str) -> Tuple[str, Set[str]]:
+        try:
+            version, merged, _ = load_published_chunks(store, document_id, logger)
+        except S3DocumentNotFoundError as exc:
+            raise LookupError(document_id) from exc
+        except (BotoCoreError, ClientError) as exc:  # S3 down is a 502 for the dataset call, not an invalid dataset
+            raise DatasetStoreError(f"could not read published document '{document_id}' from s3://{store.bucket}") from exc
+        return version, {str(chunk.get("chunk_id")) for chunk in merged}
+
+    return resolve
 
 
 def _records(data: Any) -> List[Dict[str, Any]]:

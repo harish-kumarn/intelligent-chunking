@@ -5,11 +5,17 @@ AutoGrounder — generates direct + indirect Q&A evaluation pairs per page with 
 
     input   : merged_chunks.json (chunks grouped by first source page)
     outputs : groundtruth_dataset.json  {page: {direct_questions, indirect_questions}}
-              groundtruth_dataset.csv   flat rows for spreadsheet review
+              groundtruth_dataset.csv   flat rows — the `retrieval_v1` dataset format (app.datasets.schema):
+                                        case_id, document_id, page, type, tag, answer_chunk_id, question, answer
 
 Main path
     run ─► group chunks by page ─► pending pages, `chunking_concurrency` at a time:
-           prompt ─► generate (retried) ─► write JSON ─► CSV (page order)
+           prompt ─► generate (retried) ─► keep answers whose chunk ids exist ─► case ids ─► write JSON
+        ─► CSV (page order)
+
+Identity: every question gets `case_id = {document_id}:{sha256(page|type|question)[:12]}` — deterministic,
+so a resumed or repeated run names the same question the same way; `answer_chunk_id`s the model invented
+(not among the page's chunks) are dropped, and a question left without one is dropped and counted.
 
 Failure policy: a page that fails every retry is recorded with empty question
 lists and an `error` field so the run completes, and is generated again by the next run; the
@@ -21,6 +27,7 @@ Concurrency: pages are independent; a lock guards the results and the file.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -40,12 +47,19 @@ from app.utils.fs import atomic_write_json, atomic_write_text
 from app.utils.gemini import gemini_client
 from app.utils.json_utils import repair_and_parse_json
 
-__all__ = ["AutoGrounder"]
+__all__ = ["AutoGrounder", "CSV_FIELDS", "case_id_for"]
 
 _PROMPT_TEMPLATE = (Path(__file__).parent / "prompts" / "auto_grounding_prompt.md").read_text(encoding="utf-8")
 _OUTPUT_NAME = "groundtruth_dataset.json"
-_CSV_FIELDS = ("page", "type", "tag", "answer_chunk_id", "question", "answer")
+CSV_FIELDS = ("case_id", "document_id", "page", "type", "tag", "answer_chunk_id", "question", "answer")
 _QUESTION_KEYS = (("direct", "direct_questions"), ("indirect", "indirect_questions"))
+_CHUNK_ID_SEPARATOR = ";"
+
+
+def case_id_for(document_id: str, page: Any, q_type: str, question: str) -> str:
+    """Deterministic row identity: the same question on the same page of the same document is the same case."""
+    digest = hashlib.sha256(f"{page}|{q_type}|{(question or '').strip()}".encode("utf-8")).hexdigest()[:12]
+    return f"{document_id}:{digest}"
 
 
 class AutoGrounder:
@@ -63,10 +77,20 @@ class AutoGrounder:
     # ------------------------------------------------------------------ #
 
     def run(
-        self, merged_chunks_path: Path, output_path: Optional[Path] = None, on_progress: Optional[Callable[[int, int], None]] = None,
+        self,
+        merged_chunks_path: Path,
+        output_path: Optional[Path] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        *,
+        document_id: Optional[str] = None,
     ) -> Path:
-        """Generate (or resume) groundtruth for every page; returns the JSON path."""
+        """
+        Generate (or resume) groundtruth for every page; returns the JSON path. `document_id` names the
+        rows (`case_id`, `document_id` columns); it defaults to the merged-chunks folder name (the
+        pipeline's workspace layout).
+        """
         merged_chunks_path = Path(merged_chunks_path)
+        document_id = document_id or merged_chunks_path.parent.name
         out_path = Path(output_path) if output_path else merged_chunks_path.parent / _OUTPUT_NAME
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -81,6 +105,8 @@ class AutoGrounder:
         def ground(page_no: int) -> None:
             nonlocal done
             output = self._ground_page(page_no, pages[page_no])
+            if not output.get("error"):
+                output = _normalise_page(output, page_no, {str(c["chunk_id"]) for c in pages[page_no]}, document_id, self._log)
             with lock:
                 results[str(page_no)] = output
                 atomic_write_json(out_path, dict(sorted(results.items(), key=lambda item: int(item[0]))))
@@ -92,31 +118,38 @@ class AutoGrounder:
             for future in [pool.submit(in_context(ground), page_no) for page_no in pending]:
                 future.result()  # _ground_page never raises for a model failure; an I/O error propagates
 
-        csv_path = self.to_csv(out_path)
+        csv_path = self.to_csv(out_path, document_id=document_id)
         self._log.info("Groundtruth written: %s, %s", out_path, csv_path)
         return out_path
 
-    def to_csv(self, json_path: Path, csv_path: Optional[Path] = None) -> Path:
-        """Flatten a groundtruth JSON file into one CSV row per question."""
+    def to_csv(self, json_path: Path, csv_path: Optional[Path] = None, *, document_id: Optional[str] = None) -> Path:
+        """
+        Flatten a groundtruth JSON file into one `retrieval_v1` CSV row per question. Entries written before
+        case ids existed get theirs computed here (deterministic), so older JSON converts the same way.
+        """
         json_path = Path(json_path)
         csv_path = Path(csv_path) if csv_path else json_path.with_suffix(".csv")
+        document_id = document_id or json_path.parent.name
         data = json.loads(json_path.read_text(encoding="utf-8"))
 
         rows = [
             {
+                "case_id": qa.get("case_id") or case_id_for(document_id, page, q_type, qa.get("question", "")),
+                "document_id": document_id,
                 "page": page,
                 "type": q_type,
                 "tag": qa.get("tag", ""),
-                "answer_chunk_id": ";".join(_as_list(qa.get("answer_chunk_id"))),
+                "answer_chunk_id": _CHUNK_ID_SEPARATOR.join(_as_list(qa.get("answer_chunk_id"))),
                 "question": qa.get("question", ""),
                 "answer": qa.get("answer", ""),
             }
             for page, page_data in data.items()
             for q_type, key in _QUESTION_KEYS
             for qa in page_data.get(key, [])
+            if isinstance(qa, dict)
         ]
         buffer = io.StringIO(newline="")
-        writer = csv.DictWriter(buffer, fieldnames=_CSV_FIELDS)
+        writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDS, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
         atomic_write_text(csv_path, buffer.getvalue())
@@ -192,6 +225,33 @@ def _group_by_page(chunks: List[MergedChunk]) -> Dict[int, List[Dict[str, Any]]]
             }
         )
     return dict(sorted(pages.items()))
+
+
+def _normalise_page(
+    output: Dict[str, Any], page_no: int, chunk_ids: set, document_id: str, log: logging.LoggerAdapter,
+) -> Dict[str, Any]:
+    """Keep only answer chunk ids the page really has; drop questions left without one; assign case ids."""
+    dropped_ids = dropped_questions = 0
+    normalised: Dict[str, Any] = {key: value for key, value in output.items() if key not in dict(_QUESTION_KEYS).values()}
+    for q_type, key in _QUESTION_KEYS:
+        kept: List[Dict[str, Any]] = []
+        for qa in output.get(key) or []:
+            if not isinstance(qa, dict) or not str(qa.get("question") or "").strip():
+                dropped_questions += 1
+                continue
+            ids = [chunk_id for chunk_id in dict.fromkeys(_as_list(qa.get("answer_chunk_id"))) if chunk_id in chunk_ids]
+            dropped_ids += len(_as_list(qa.get("answer_chunk_id"))) - len(ids)
+            if not ids:
+                dropped_questions += 1
+                continue
+            kept.append({**qa, "answer_chunk_id": ids, "case_id": case_id_for(document_id, page_no, q_type, qa.get("question", ""))})
+        normalised[key] = kept
+    if dropped_ids or dropped_questions:
+        log.warning(
+            "Page %d grounding: dropped %d unknown chunk id(s) and %d question(s) without a valid answer chunk",
+            page_no, dropped_ids, dropped_questions,
+        )
+    return normalised
 
 
 def _is_grounded(entry: Any) -> bool:

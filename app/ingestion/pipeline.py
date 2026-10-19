@@ -26,6 +26,9 @@ assignment whose chunk is unchanged, stage 7 every page already grounded.
 Progress: `on_progress(stage, done, total)` is called as each stage advances — stage names are
 `STAGES` (ocr · chunk · merge · classify · vocab · ground · index); the caller weights them.
 
+Tracing: each stage is a child span of the caller's trace (`app.observability.SpanName`); stage 3 adds one
+`chunk_page` generation per page (model, token usage, retries). Only counts, models and ids are recorded.
+
 Failure policy: every stage error propagates — a partially ingested document is never reported
 as complete — except a chunk the classifier could not label, which is indexed without categories
 (app.classification.stage). A document with no chunk at all raises `NoContentError` after stage 4,
@@ -57,6 +60,8 @@ from app.ingestion.document_parser import md_to_page_json
 from app.ingestion.errors import IncompleteStageError, NoContentError
 from app.ingestion.ocr import run_ocr
 from app.logging.setup import get_logger, in_context
+from app.observability.modules import SpanName
+from app.observability.telemetry import get_telemetry
 from app.postprocessing.merger import MergedChunk, merge_file
 from app.postprocessing.vocab_index import build_vocab_index
 from app.retrieval.documents import merged_chunks_to_documents
@@ -173,25 +178,40 @@ class IngestPipeline:
         self._progress = on_progress or (lambda stage, done, total: None)
 
         should_classify = classification if classification is not None else self._cfg.classification_enabled
+        telemetry = get_telemetry()
 
         renderer = _Background(self._render_ahead, ws, name="render")  # needs only the PDF: overlaps OCR
         try:
-            pages = self._stage_ocr(ws)
+            with telemetry.span(SpanName.OCR, ocr_technique=self._cfg.ocr_technique) as span:
+                pages = self._stage_ocr(ws)
+                span.set_output(page_count=len(pages))
         finally:
             renderer.join()  # never leave a thread writing into a workspace that may be removed
         document_language = resolve_document_language(
             "\n".join(pages.values()), language, collection_name, config=self._cfg, logger=self._log,
         )  # before the paid stages: a document the collection cannot take stops here
-        self._stage_render(ws, len(pages), renderer)
+        with telemetry.span(SpanName.RENDER, page_count=len(pages)):
+            self._stage_render(ws, len(pages), renderer)
         self._stage_chunk(ws, pages)
-        merged = self._stage_merge(ws)
+        with telemetry.span(SpanName.MERGE) as span:
+            merged = self._stage_merge(ws)
+            span.set_output(chunks_out=len(merged))
         if not merged:
             raise NoContentError(doc, len(pages))  # before classify / vocab / ground / index: nothing to label or publish
-        classified = self._stage_classify(ws) if should_classify else None
-        if classified is not None:
+        classified = None
+        if should_classify:
+            with telemetry.span(
+                SpanName.CLASSIFY, classification_model=self._cfg.classification_model, batch_size=self._cfg.classification_batch_size,
+            ) as span:
+                classified = self._stage_classify(ws)
+                span.set_output(classified=classified.classified, failed=classified.failed)
             merged = classified.chunks
-        self._stage_vocab(ws)
-        groundtruth = self._stage_ground(ws) if autogrounding else None
+        with telemetry.span(SpanName.VOCAB):
+            self._stage_vocab(ws)
+        groundtruth = None
+        if autogrounding:
+            with telemetry.span(SpanName.AUTOGROUNDING, autogrounding_model=self._cfg.autogrounding_model):
+                groundtruth = self._stage_ground(ws, document_id=doc)
 
         if collection_name:
             self._stage_index(merged, collection_name, document_id=doc, language=document_language)
@@ -298,31 +318,37 @@ class IngestPipeline:
             )
 
         failed: Dict[int, str] = {}
-        chunk_page = in_context(chunker.chunk_page)
-        pool = ThreadPoolExecutor(max_workers=self._cfg.chunking_concurrency, thread_name_prefix="chunk")
-        futures: Dict[Future, int] = {pool.submit(chunk_page, page_input(n)): n for n in pending}
-        try:
-            for future in as_completed(futures):
-                page_no = futures[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    if is_fatal_gemini_error(exc):
-                        raise
-                    failed[page_no] = f"{type(exc).__name__}: {exc}"
-                    self._log.error("Stage 3 chunk: page %d failed every attempt; continuing with the others: %s", page_no, exc)
-                    continue
-                done += 1
-                self._progress("chunk", done, len(numbers))
-        except BaseException:
-            for future in futures:
-                future.cancel()  # pages not started yet; running ones finish and are stored for the resume
-            raise
-        finally:
-            pool.shutdown(wait=True)
-            store.flush()
-        if failed:
-            raise IncompleteStageError("chunk", failed, len(numbers))
+        # The span is entered before `in_context` copies the context, so every page generation is its child.
+        with get_telemetry().span(
+            SpanName.INTELLIGENT_CHUNKING, chunking_model=self._cfg.chunking_model, prompt_fingerprint=chunker.prompt_fingerprint,
+            concurrency=self._cfg.chunking_concurrency, pages_total=len(numbers), pages_pending=len(pending), pages_resumed=done,
+        ) as span:
+            chunk_page = in_context(chunker.chunk_page)
+            pool = ThreadPoolExecutor(max_workers=self._cfg.chunking_concurrency, thread_name_prefix="chunk")
+            futures: Dict[Future, int] = {pool.submit(chunk_page, page_input(n)): n for n in pending}
+            try:
+                for future in as_completed(futures):
+                    page_no = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        if is_fatal_gemini_error(exc):
+                            raise
+                        failed[page_no] = f"{type(exc).__name__}: {exc}"
+                        self._log.error("Stage 3 chunk: page %d failed every attempt; continuing with the others: %s", page_no, exc)
+                        continue
+                    done += 1
+                    self._progress("chunk", done, len(numbers))
+            except BaseException:
+                for future in futures:
+                    future.cancel()  # pages not started yet; running ones finish and are stored for the resume
+                raise
+            finally:
+                pool.shutdown(wait=True)
+                store.flush()
+            span.set_output(failed=len(failed), page_count=done)
+            if failed:
+                raise IncompleteStageError("chunk", failed, len(numbers))
 
     def _stage_merge(self, ws: _Workspace) -> List[MergedChunk]:
         self._log.info("Stage 4 merge: fusing cross-page chains")
@@ -344,10 +370,12 @@ class IngestPipeline:
         build_vocab_index(ws.merged_chunks, ws.vocab_index, self._cfg, self._log)
         self._progress("vocab", 1, 1)
 
-    def _stage_ground(self, ws: _Workspace) -> Path:
+    def _stage_ground(self, ws: _Workspace, *, document_id: str) -> Path:
         self._log.info("Stage 7 ground: generating evaluation Q&A")
         self._progress("ground", 0, 1)
-        path = AutoGrounder(self._cfg, self._log).run(ws.merged_chunks, on_progress=lambda d, t: self._progress("ground", d, t))
+        path = AutoGrounder(self._cfg, self._log).run(
+            ws.merged_chunks, on_progress=lambda d, t: self._progress("ground", d, t), document_id=document_id,
+        )
         self._progress("ground", 1, 1)
         return path
 
@@ -412,9 +440,15 @@ def index_merged_chunks(
     logger.info("Stage 8 index: upserting %d document(s) into '%s' (language=%s)", len(documents), collection_name, language)
     if on_progress is not None:
         on_progress(0, len(documents))
-    # The retriever owns an executor and live connections — release them per ingestion.
-    with EnhancedCohereMilvusRetriever(collection_name, config=config, logger=logger, language=language) as retriever:
-        retriever.replace_document(documents, document_id=document_id, batch_size=config.index_batch_size, on_progress=on_progress)
+    with get_telemetry().span(
+        SpanName.MILVUS_INDEX, collection_name=collection_name, language=language, chunk_count=len(documents), batch_size=config.index_batch_size,
+    ) as span:
+        # The retriever owns an executor and live connections — release them per ingestion.
+        with EnhancedCohereMilvusRetriever(collection_name, config=config, logger=logger, language=language) as retriever:
+            written = retriever.replace_document(
+                documents, document_id=document_id, batch_size=config.index_batch_size, on_progress=on_progress,
+            )
+            span.set_output(rows_upserted=len(written), embedding_model=retriever.embedding_model)
 
 
 class _Background:
@@ -422,10 +456,11 @@ class _Background:
 
     def __init__(self, target: Callable[..., None], *args: object, name: str) -> None:
         self.error: Optional[BaseException] = None
+        bound = in_context(target)  # the thread logs (and traces) under the run's context
 
         def run() -> None:
             try:
-                target(*args)
+                bound(*args)
             except BaseException as exc:  # handed to the main thread, which decides
                 self.error = exc
 

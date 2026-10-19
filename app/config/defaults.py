@@ -34,6 +34,20 @@ __all__ = ["ChunkerConfig"]
 _PAGE_IMAGES_DIR = "page_images"  # PyMuPDF renders consumed by the vision chunker
 _OCR_IMAGES_DIR = "pdf_images"    # figures the OCR stage extracted from the PDF
 
+# Behaviour-affecting, non-secret fields that make up the configuration fingerprint stamped on traces.
+_FINGERPRINT_FIELDS = (
+    "ocr_technique", "azure_ocr_model", "azure_ocr_extract_figures", "azure_ocr_figure_dpi", "mistral_ocr_model",
+    "ocr_window_pages", "ocr_window_max_bytes",
+    "chunking_model", "chunking_temperature",
+    "classification_enabled", "classification_allow_new_categories", "classification_categories", "classification_model",
+    "classification_temperature", "classification_thinking_level", "classification_batch_size", "classification_batch_max_chars",
+    "autogrounding_model", "autogrounding_temperature", "autogrounding_min_direct", "autogrounding_max_direct",
+    "autogrounding_min_indirect", "autogrounding_max_indirect",
+    "vocab_model", "vocab_temperature", "vocab_semantic_dedup", "requery_model", "requery_temperature",
+    "embedding_model", "reranking_model", "japanese_embedding_model", "japanese_reranking_model", "japanese_detection_threshold",
+    "milvus_index_type", "milvus_metric_type", "milvus_index_params", "milvus_search_params",
+)
+
 
 class ChunkerConfig(BaseSettings):
     """Pipeline + provider configuration, populated from the environment."""
@@ -215,6 +229,19 @@ class ChunkerConfig(BaseSettings):
     # Workspace
     # ------------------------------------------------------------------ #
     resources_base: str = Field(default="ic_resources", alias="IC_RESOURCES_BASE")
+
+    # ------------------------------------------------------------------ #
+    # Observability
+    # ------------------------------------------------------------------ #
+
+    def fingerprint_fields(self) -> Dict[str, Any]:
+        """
+        The settings that change what the pipeline produces — models, prompts' tuning, OCR engine, fusion
+        defaults — as a plain mapping for `app.observability.versioning.config_fingerprint`. An explicit
+        allowlist: keys, hosts, paths, timeouts and retry budgets are left out (they change nothing in the
+        output and must never reach a trace).
+        """
+        return {name: getattr(self, name) for name in _FINGERPRINT_FIELDS}
 
     # ------------------------------------------------------------------ #
     # Derived paths

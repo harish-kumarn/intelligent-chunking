@@ -15,13 +15,18 @@ from __future__ import annotations
 import re
 
 __all__ = [
-    "COLLECTION_NAME_RULE", "MAX_CATEGORIES", "MAX_CATEGORY_NAME_LEN", "normalize_category_name", "normalize_collection_name",
-    "sanitize_collection_name",
+    "COLLECTION_NAME_RULE", "DOCUMENT_ID_PATTERN", "DOCUMENT_ID_RULE", "MAX_CATEGORIES", "MAX_CATEGORY_NAME_LEN",
+    "normalize_category_name", "normalize_collection_name", "sanitize_collection_name",
 ]
 
 _MAX_COLLECTION_NAME_LEN = 255  # Milvus limit
 _INVALID_CHARS = re.compile(r"[^a-zA-Z0-9_]")
 _UNDERSCORE_RUNS = re.compile(r"_+")
+
+#: What `sanitize_collection_name` produces for a document id (a PDF stem): never starts with a digit or `_`
+#: (so it never collides with the `_collections/` / `_datasets/` S3 prefixes). Dataset rows are checked against it.
+DOCUMENT_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,254}$")
+DOCUMENT_ID_RULE = "1-255 characters: letters, digits and '_', starting with a letter"
 
 _COLLECTION_NAME = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 COLLECTION_NAME_RULE = "3-64 characters: lowercase letters, digits and '_', starting with a letter"

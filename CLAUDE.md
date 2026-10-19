@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A single FastAPI service ("Vision RAG"): PDF → OCR (Azure DI or Mistral) → Gemini vision chunking per page →
 cross-page merge → Cohere embeddings + Milvus server-side BM25 → hybrid retrieval with fusion + Cohere rerank.
 Detailed docs live in `docs/` (ARCHITECTURE, API, CONFIGURATION, ARTIFACTS, CLASSIFICATION, DEPLOYMENT,
-INGESTION_RELIABILITY, JAPANESE_RETRIEVAL, HYPERPARAMETERS) — read the relevant one before changing behaviour in that
-area, and keep it in sync.
+INGESTION_RELIABILITY, JAPANESE_RETRIEVAL, HYPERPARAMETERS, OBSERVABILITY, DATASETS) — read the relevant one before
+changing behaviour in that area, and keep it in sync.
 
 ## Commands
 
@@ -26,9 +26,11 @@ ruff check app tests                       # line length 130, rules E,F,I,B
 
 `tests/conftest.py` forces `APP_ENV=test`, `ARTIFACT_MODE=production`, `WARM_UP_JAPANESE_ANALYZER=false`, throwaway
 `INGEST_WORKSPACE_DIR` / `DEBUG_WORKSPACE` (a job record left in a real one would be resumed by a test app), zero retry
-delays, and
-the `chunker_config` fixture builds `ChunkerConfig(_env_file=None, ...)` so tests never read the real `.env`.
-Note `tests/` and `evaluation/` are listed in `.gitignore` (tests are nonetheless tracked).
+delays, `LANGFUSE_ENABLED=false`, disables `env_file` on every settings class so tests never read the real `.env`, and
+provides `chunker_config`, `server_settings`, `fake_s3` (one in-memory S3 behind `build_s3_client`) and
+`recording_telemetry` (Langfuse with an in-memory OpenTelemetry exporter — no network). `tests/fakes.py` holds the
+S3 / Langfuse fakes. **`tests/`, `evaluation/` and `requirements-dev.txt` are gitignored and exist only locally** — they are
+not on any branch; keep them in sync with the code you change, and do not assume CI runs them.
 
 The `evaluation/` hyper-parameter harness (not part of the service) is run as modules, e.g.
 `python -m evaluation.hp.experiments.e00_sanity`; it needs real API keys and Milvus on `127.0.0.1:19530`, and only
@@ -36,11 +38,31 @@ touches collections prefixed `hp_`. See `evaluation/README.md`.
 
 ## Architecture
 
-**Lifecycle.** `app/main.py:create_app` lifespan builds every process-scoped object once (`ChunkerConfig`,
-`ChannelOrchestrator` + `PDFChannel`, `ProcessingGate`, `IngestionJobManager` (loads job records, may resume one),
-`RetrieverRegistry`, `QueryReformulationService`) onto `app.state`; routes reach them only via `app/api/dependencies.py`. Dependencies point downward only:
-`api → orchestration → ingestion → {chunking, postprocessing, classification, groundtruth, retrieval} → storage`;
-`config`, `logging`, `utils` import nothing from `app`.
+**Lifecycle.** `app/main.py:create_app` lifespan builds every process-scoped object once (`ChunkerConfig`, telemetry
+(`configure_telemetry`, or the instance passed as `create_app(telemetry=…)` by tests), `ChannelOrchestrator` + `PDFChannel`,
+`ProcessingGate`, `IngestionJobManager` (loads job records, may resume one), `RetrieverRegistry`,
+`QueryReformulationService`) onto `app.state`; routes reach them only via `app/api/dependencies.py`.
+`RequestContextMiddleware` (`app/api/middleware.py`) gives every request its `request_id` and `ExecutionContext`
+(`X-Execution-*` headers) and returns `X-Request-Id` / `X-Trace-Id`. Dependencies point downward only:
+`api → orchestration → {ingestion, datasets} → {chunking, postprocessing, classification, groundtruth, retrieval} → storage`;
+`config`, `logging`, `utils` import nothing from `app`; `observability` imports only `logging`.
+
+**Observability** (`app/observability/`, `docs/OBSERVABILITY.md`). `get_telemetry().trace(ModuleName.X, …)` opens the
+one root trace of a workflow run (`PDFChannel.process`, `S3DocumentImporter.import_document`,
+`S3DocumentGrounder.ground_document`, `retrieve_async`, `reformulate`, `DatasetService`); stages / arms are
+`.span(SpanName.X, …)`, each chunked page a `.generation(...)`. Names are **enums only** (`modules.py`) — never pass a
+string, never add a trace name outside the registry. Metadata keys must be in `sanitize.METADATA_KEYS`; there is
+deliberately no key for text/prompts/output — do not add one. Telemetry is secondary: it never raises into a run; the
+default is the no-op. Context (request id, execution context, current span) rides on contextvars: any new thread pool
+or executor call must be wrapped with `app.logging.setup.in_context`. Query text is logged at INFO only as
+`query_fingerprint(...)`.
+
+**Datasets** (`app/datasets/`, `docs/DATASETS.md`). Ground-truth CSVs live in S3 under
+`_datasets/{module}/{name}/versions/{v-…}/` — immutable, content-addressed (`S3DatasetStore`, conditional puts), S3
+is canonical, Langfuse Datasets only a mirror. The CSV contract per module is in `datasets/schema.py` (`retrieval_v1`
+for `hybrid_retrieval`; auto-grounding emits it directly, with deterministic `case_id`s). Validation errors carry row
+numbers and codes, never cell values — keep it that way. Reference checks reach published chunks through
+`app/orchestration/s3_import.py:published_chunk_ids` injected into `DatasetService` (datasets never imports orchestration).
 
 **Ingestion** (`POST /v1/documents`, or async `POST /v1/ingestion-jobs` + poll — the path for long PDFs): one document
 per process — `app/concurrency.py`'s in-process gate returns 429 when busy, which is why the container runs exactly
@@ -110,7 +132,9 @@ Client-caused `ChannelError`s carry their HTTP status (`http_status`: 400, 404 `
 ## Configuration
 
 Two settings objects, never overlapping: `ChunkerConfig` (`app/config/defaults.py` — providers, models, Milvus,
-pipeline) and `ServerSettings` (`app/config/settings.py` — HTTP layer, `ARTIFACT_MODE`, S3 defaults, limits).
-Priority: env var → `.env` → `config.yaml` → field default. `config.yaml` holds non-secret switches only
-(`ocr.technique: azure|mistral`, default mistral; the `classification:` block); secrets stay in `.env`. Full reference:
-`docs/CONFIGURATION.md`.
+pipeline; `fingerprint_fields()` is the allowlist behind the trace `config_fingerprint`) and `ServerSettings`
+(`app/config/settings.py` — HTTP layer, `ARTIFACT_MODE`, S3 / dataset defaults, Langfuse, limits; `LANGFUSE_ENABLED`
+without keys fails validation), plus the small `AwsCredentials` / `S3ClientOptions` in `app/config/aws.py` (boto3 cannot
+see `.env`). Priority: env var → `.env` → `config.yaml` → field default. `config.yaml` holds non-secret switches only
+(`ocr.technique: azure|mistral`, default mistral; the `classification:` block); secrets (provider keys, Langfuse keys)
+stay in `.env`. Full reference: `docs/CONFIGURATION.md`.

@@ -43,7 +43,7 @@ async def query_retrieval(
     registry: RetrieverRegistry = Depends(get_retriever_registry),
     logger: logging.LoggerAdapter = Depends(get_logger),
 ) -> RetrievalQueryResponse:
-    token = request_id_var.set(uuid.uuid4().hex)
+    token = request_id_var.set(request_id_var.get() or uuid.uuid4().hex)  # id from the middleware
     started = time.monotonic()
     try:
         collection = payload.collection_name  # CollectionName: already normalised
@@ -99,7 +99,7 @@ async def reformulate_query(
     settings: ServerSettings = Depends(get_settings),
     logger: logging.LoggerAdapter = Depends(get_logger),
 ) -> QueryReformulationResponse:
-    token = request_id_var.set(uuid.uuid4().hex)
+    token = request_id_var.set(request_id_var.get() or uuid.uuid4().hex)  # id from the middleware
     started = time.monotonic()
     try:
         collection = payload.collection_name

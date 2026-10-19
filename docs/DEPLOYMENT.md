@@ -37,6 +37,7 @@ single-flight gate and the job records assume one process owns the directory.
 |---|---|
 | **Always** | `GOOGLE_API_KEY`, `COHERE_API_KEY`, `MILVUS_HOST`, `MILVUS_PORT`, plus the selected OCR engine's keys — `AZURE_OCR_ENDPOINT`/`AZURE_OCR_KEY` (default) or `MISTRAL_API_KEY` |
 | **Optional** | `GROQ_API_KEY` (reformulation), `S3_UPLOAD_ENABLED` + `S3_BUCKET`/`AWS_DEFAULT_REGION` + `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (or an IAM role), `MILVUS_TOKEN` / `MILVUS_USER`+`MILVUS_PASSWORD`, `MILVUS_SECURE=true` |
+| **Tracing** | `LANGFUSE_ENABLED=true` + `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY` (+ `LANGFUSE_HOST` for self-hosted), optionally `PIPELINE_VERSION` — [OBSERVABILITY.md](OBSERVABILITY.md). Enabled without keys fails at startup |
 | **Production** | `APP_ENV=production` (JSON logs), `ARTIFACT_MODE=production` (no local artifacts) |
 
 See [CONFIGURATION.md](CONFIGURATION.md) for every knob.
@@ -66,8 +67,17 @@ See [CONFIGURATION.md](CONFIGURATION.md) for every knob.
 ## S3 permissions
 
 The role/credentials used by boto3 need, on the artifact bucket:
-`s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:DeleteObject` (retention). Nothing is read outside
-`{document_id}/…` prefixes.
+
+| Prefix | Operations | Why |
+|---|---|---|
+| `{document_id}/*` | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | artifact versions, `current.json`, retention |
+| `_collections/*` | `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | the collection registry (query reformulation; deleted with the collection) |
+| `_datasets/*` | `s3:GetObject`, `s3:PutObject` | ground-truth dataset versions ([DATASETS.md](DATASETS.md)); recommended explicit **Deny** of `s3:DeleteObject` on `_datasets/*/versions/*` so historical versions are immutable at the bucket level too |
+| bucket | `s3:ListBucket` | retention and dataset version listing |
+
+The evaluation pipeline needs only `s3:GetObject` on `_datasets/*` and `s3:ListBucket` with `s3:prefix` =
+`_datasets/*`. Every client uses botocore's standard retry mode with `S3_CONNECT_TIMEOUT_SECONDS` /
+`S3_READ_TIMEOUT_SECONDS`, so an S3 outage surfaces as an error (502 on dataset routes) instead of a hung request.
 
 ## Sizing
 
@@ -94,7 +104,10 @@ JSON per line in production, e.g.
 ```
 
 Useful filters: `stage=completed status=completed` (throughput), `level=ERROR` (failed arms / stages),
-`log_module=RETRIEVER` (per-query one-line summaries with hit counts and latency).
+`log_module=RETRIEVER` (per-query one-line summaries with hit counts and latency). `request_id` equals the
+`X-Request-Id` response header, also inside ingestion-job threads; query text is logged at INFO only as a
+sha256 fingerprint (the text itself at DEBUG). Per-stage timing, model usage and errors are in Langfuse when
+tracing is on ([OBSERVABILITY.md](OBSERVABILITY.md)).
 
 ## Upgrade notes
 
@@ -110,3 +123,8 @@ Useful filters: `stage=completed status=completed` (throughput), `level=ERROR` (
   ones are removed as stale.
 - Debug-mode workspaces moved from `DEBUG_WORKSPACE/<document_id>.pdf` + `DEBUG_WORKSPACE/<document_id>/` to
   `DEBUG_WORKSPACE/<document_id>/` (PDF, marker, artifact folder), the same layout as production.
+- `groundtruth_dataset.csv` gained two leading columns, `case_id` and `document_id` (the `retrieval_v1` dataset
+  format); spreadsheet consumers of the old six-column file see them first. Job records gained `request_id`,
+  `trace_ids` and `request.execution`; records written by older versions load unchanged.
+- Dataset versions need S3 conditional writes (`PutObject` with `If-None-Match`): boto3 ≥ 1.35 and an S3 (or
+  S3-compatible) endpoint that supports them.

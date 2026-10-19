@@ -25,6 +25,10 @@ Durability: one JSON file per job under `ServerSettings.jobs_dir` (`JobStore`), 
 every status change and at most every `_PERSIST_SECONDS` while progress moves. Without a
 directory (tests) jobs live in memory only.
 
+Identity: the record keeps the submitting request's id and execution context (`X-Execution-*` headers);
+the job thread restores both, so its logs carry the request id and every attempt is one `document_ingestion`
+trace in the session named by the execution id (the job id by default). The trace ids are recorded on the job.
+
 Failure policy: `ChannelError` → failed, not retryable (the request is wrong, e.g. DOCUMENT_ID_CONFLICT);
 `RetrievalError` / `NoContentError` → failed with its code, not retryable (e.g. the collection holds another
 language; the PDF has no content); anything else →
@@ -51,7 +55,8 @@ from app.chunking.chunker import is_fatal_gemini_error
 from app.concurrency import ProcessingGate
 from app.ingestion.errors import NoContentError
 from app.ingestion.pipeline import STAGES, IngestResult
-from app.logging.setup import document_id_var
+from app.logging.setup import document_id_var, request_id_var
+from app.observability.context import ExecutionContext, execution_var, trace_ids_var
 from app.orchestration.errors import ChannelError
 from app.orchestration.orchestrator import ChannelOrchestrator
 from app.retrieval.errors import RetrievalError
@@ -98,10 +103,13 @@ class IngestionRequest:
     s3_bucket: Optional[str] = None
     AWS_DEFAULT_REGION: Optional[str] = None
     replace: bool = False                    # replace a different PDF already published under this document id
+    execution: Optional[Dict[str, Any]] = None  # ExecutionContext.to_dict(): the X-Execution-* / X-Dataset-* / X-Case-Id headers
+
+    _NOT_OPTIONS = ("document_id", "filename", "content_hash", "execution")
 
     def options(self) -> Dict[str, Any]:
         """The channel's `process` options."""
-        return {key: value for key, value in asdict(self).items() if key not in ("document_id", "filename", "content_hash")}
+        return {key: value for key, value in asdict(self).items() if key not in self._NOT_OPTIONS}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "IngestionRequest":
@@ -130,6 +138,8 @@ class IngestionJob:
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     retryable: bool = False
+    request_id: Optional[str] = None         # of the submitting request: the job thread logs and traces under it
+    trace_ids: Tuple[str, ...] = ()          # one root trace per attempt (empty when tracing is off)
 
     @property
     def document_id(self) -> str:
@@ -139,17 +149,24 @@ class IngestionJob:
     def content_hash(self) -> str:
         return self.request.content_hash
 
+    @property
+    def execution_id(self) -> str:
+        """Groups the job's traces (Langfuse session): the caller's X-Execution-Id, else the job id."""
+        return ExecutionContext.from_dict(self.request.execution).execution_id or self.job_id
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "IngestionJob":
         result = data.get("result")
+        known = {f.name for f in fields(cls)}
         return cls(**{
-            **data,
+            **{key: value for key, value in data.items() if key in known},
             "request": IngestionRequest.from_dict(data["request"]),
             "stages": tuple(data["stages"]),
             "result": IngestResult(**result) if result else None,
+            "trace_ids": tuple(data.get("trace_ids") or ()),
         })
 
 
@@ -281,6 +298,7 @@ class IngestionJobManager:
                     raise ServerBusyError("Another document is processing; retry shortly.")
                 job = IngestionJob(
                     job_id=uuid.uuid4().hex, request=request, stages=self._stages(request), max_attempts=self._max_attempts,
+                    request_id=request_id_var.get(),
                 )
                 self._jobs[job.job_id] = job
             self._store.save(job)
@@ -354,7 +372,10 @@ class IngestionJobManager:
         """
         started = time.monotonic()
         job = self._snapshot(job_id)
-        document_id_var.set(job.document_id)  # a new thread starts without the request's log context
+        # A new thread starts without the request's context: restore it so logs and traces are attributable.
+        document_id_var.set(job.document_id)
+        request_id_var.set(job.request_id)
+        execution_var.set(ExecutionContext.from_dict(job.request.execution).with_defaults(execution_id=job.job_id))
         outcome: Optional[Dict[str, Any]] = None
         try:
             outcome = self._execute(orchestrator, job, source)
@@ -390,17 +411,22 @@ class IngestionJobManager:
             return _failure(_INTERRUPTED, "The interrupted run's workspace is gone; resubmit the PDF", retryable=True)
 
         attempt = job.attempt
+        base_execution = execution_var.get() or ExecutionContext()
         while True:
             attempt += 1
             self._update(job.job_id, status=RUNNING, attempt=attempt, started_at=job.started_at or _now())
+            execution_var.set(base_execution.with_defaults(attempt=attempt))  # one trace per attempt, same session
+            trace_ids_var.set(attempt_traces := [])
             try:
                 result = channel.process(
                     document_id=request.document_id, source=admitted, content_hash=request.content_hash,
                     on_progress=lambda s, d, t: self._on_progress(job.job_id, s, d, t), **request.options(),
                 )
             except (ChannelError, RetrievalError, NoContentError) as exc:
+                self._record_traces(job.job_id, attempt_traces)
                 return _failure(exc.code, str(exc), retryable=False)
             except Exception as exc:  # every pipeline failure is the job's outcome; the workspace is kept for a resume
+                self._record_traces(job.job_id, attempt_traces)
                 if attempt >= job.max_attempts or self._stopping.is_set() or is_fatal_gemini_error(exc):
                     self._log.error("Ingestion job failed: job=%s attempt=%d/%d error=%s", job.job_id, attempt, job.max_attempts, exc,
                                     exc_info=True)
@@ -413,10 +439,21 @@ class IngestionJobManager:
                 if self._stopping.wait(delay):
                     return None
                 continue
+            self._record_traces(job.job_id, attempt_traces)
             return dict(
                 status=SUCCEEDED, finished_at=_now(), finished_epoch=time.time(), result=result, progress=1.0,
                 error_code=None, error_message=None, retryable=False,
             )
+
+    def _record_traces(self, job_id: str, trace_ids: List[str]) -> None:
+        if not trace_ids:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            self._jobs[job_id] = updated = replace(job, trace_ids=job.trace_ids + tuple(trace_ids))
+        self._store.save(updated)
 
     def _on_progress(self, job_id: str, stage: str, done: int, total: int) -> None:
         with self._lock:

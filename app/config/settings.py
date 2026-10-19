@@ -5,8 +5,9 @@ ServerSettings — configuration for the HTTP layer only.
 
     artifact policy : debug (keep a workspace) vs production (per-document workspace, kept for a resume
                       until the document succeeds)
-    S3 defaults     : bucket/region used when a request does not name its own
-    limits          : upload size, log level, bind address
+    S3 defaults     : bucket/region used when a request does not name its own; the dataset bucket
+    observability   : Langfuse switch, keys, timeout, sampling; the pipeline version stamped on traces
+    limits          : upload size (PDF and dataset CSV), log level, bind address
 
 Provider and pipeline settings live in `ChunkerConfig`; the two never overlap.
 
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
 import yaml
-from pydantic import Field
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
@@ -35,6 +36,8 @@ __all__ = [
 
 _DEFAULT_MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB — large scanned manuals fit, abuse does not
 _DEFAULT_MAX_PDF_PAGES = 2000                  # a 1,000-page manual fits twice; bounds one job's cost
+_DEFAULT_MAX_DATASET_BYTES = 25 * 1024 * 1024  # 25 MiB of CSV — tens of thousands of ground-truth rows
+_DEFAULT_MAX_DATASET_ROWS = 50_000
 _JOBS_DIR = "_jobs"        # under the workspace root: one JSON record per ingestion job
 _UPLOADS_DIR = "_uploads"  # under the workspace root: uploads streamed to disk before they are admitted
 
@@ -152,6 +155,25 @@ class ServerSettings(BaseSettings):
     s3_upload_enabled: bool = Field(default=False, alias="S3_UPLOAD_ENABLED")
     s3_bucket: Optional[str] = Field(default=None, alias="S3_BUCKET")
     AWS_DEFAULT_REGION: Optional[str] = Field(default=None, alias="AWS_DEFAULT_REGION")
+    # Ground-truth datasets (`_datasets/…`, docs/DATASETS.md) default to the artifact bucket.
+    s3_dataset_bucket: Optional[str] = Field(default=None, alias="S3_DATASET_BUCKET")
+    max_dataset_upload_bytes: int = Field(default=_DEFAULT_MAX_DATASET_BYTES, ge=1, alias="MAX_DATASET_UPLOAD_BYTES")
+    max_dataset_rows: int = Field(default=_DEFAULT_MAX_DATASET_ROWS, ge=1, alias="MAX_DATASET_ROWS")
+
+    # Langfuse tracing (docs/OBSERVABILITY.md). Off by default; enabled without keys fails at startup.
+    langfuse_enabled: bool = Field(default=False, alias="LANGFUSE_ENABLED")
+    langfuse_public_key: Optional[str] = Field(default=None, alias="LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key: Optional[SecretStr] = Field(default=None, alias="LANGFUSE_SECRET_KEY")
+    # The SDK's own name is LANGFUSE_BASE_URL; both are read (pydantic-settings never exports .env to the SDK). Unset → Langfuse Cloud.
+    langfuse_host: Optional[str] = Field(
+        default=None, alias="LANGFUSE_HOST", validation_alias=AliasChoices("LANGFUSE_HOST", "LANGFUSE_BASE_URL"),
+    )
+    langfuse_timeout_seconds: int = Field(default=5, ge=1, le=120, alias="LANGFUSE_TIMEOUT")
+    langfuse_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0, alias="LANGFUSE_SAMPLE_RATE")
+    langfuse_capture_query_text: bool = Field(default=False, alias="LANGFUSE_CAPTURE_QUERY_TEXT")
+    langfuse_dataset_sync_max_items: int = Field(default=5000, ge=1, alias="LANGFUSE_DATASET_SYNC_MAX_ITEMS")
+    # Stamped on every trace as its `version`; defaults to `service_version`.
+    pipeline_version: Optional[str] = Field(default=None, alias="PIPELINE_VERSION")
 
     max_upload_size_bytes: int = Field(default=_DEFAULT_MAX_UPLOAD_BYTES, alias="MAX_UPLOAD_SIZE_BYTES")
     max_pdf_pages: int = Field(default=_DEFAULT_MAX_PDF_PAGES, ge=1, alias="MAX_PDF_PAGES")
@@ -160,9 +182,24 @@ class ServerSettings(BaseSettings):
     host: str = Field(default="0.0.0.0", alias="SERVER_HOST")
     port: int = Field(default=8000, alias="SERVER_PORT")
 
+    @model_validator(mode="after")
+    def _langfuse_complete(self) -> "ServerSettings":
+        """A half-configured tracer fails here, at startup, not on the first request."""
+        if self.langfuse_enabled and not (self.langfuse_public_key and self.langfuse_secret_key):
+            raise ValueError("LANGFUSE_ENABLED=true requires LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY")
+        return self
+
     @property
     def debug(self) -> bool:
         return self.artifact_mode == "debug"
+
+    @property
+    def dataset_bucket(self) -> Optional[str]:
+        return self.s3_dataset_bucket or self.s3_bucket
+
+    @property
+    def effective_pipeline_version(self) -> str:
+        return (self.pipeline_version or "").strip() or self.service_version
 
     @property
     def workspace_root(self) -> Path:

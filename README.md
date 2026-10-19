@@ -101,12 +101,14 @@ app/
 ├── classification/         main/sub category per chunk: category memory, Gemini classifier, prompts/
 ├── groundtruth/            optional Q&A evaluation-set generator
 ├── retrieval/              retriever, language profiles + Milvus schema, fusion, rerank, embeddings, reformulation, registry
-├── storage/                S3 artifact store (content-hash versions, publish, retention)
-├── config/                 ChunkerConfig, ServerSettings
+├── datasets/               ground-truth dataset contract, validation, publication, Langfuse mirror
+├── storage/                S3 artifact store (content-hash versions, publish, retention), dataset store, S3 client builder
+├── config/                 ChunkerConfig, ServerSettings, AWS credentials / client options
 ├── logging/                structured logging (console in dev, JSON elsewhere)
+├── observability/          module registry, execution context, Langfuse tracing facade
 ├── concurrency.py          single-flight admission gate for ingestion
 └── utils/                  JSON repair, naming, PDF rendering
-tests/                      offline unit tests (fakes for every provider)
+tests/                      offline unit tests (fakes for every provider) — kept locally, gitignored
 docs/                       current documentation; docs/archive/ holds superseded design notes
 ```
 
@@ -128,6 +130,8 @@ ruff check app tests
 | [docs/CLASSIFICATION.md](docs/CLASSIFICATION.md) | Stage 5 chunk classification: category memory, rules, Milvus filter fields |
 | [docs/JAPANESE_RETRIEVAL.md](docs/JAPANESE_RETRIEVAL.md) | Language profiles, Japanese benchmark, Milvus 2.6 upgrade and re-ingest runbook |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Container, sizing, readiness, logs, S3 permissions |
+| [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) | Langfuse tracing: module registry, execution headers, trace shapes, how an evaluation pipeline queries them |
+| [docs/DATASETS.md](docs/DATASETS.md) | Ground-truth datasets: S3 layout, immutable versions, `retrieval_v1` CSV contract, API, Langfuse mirror |
 | [docs/archive/](docs/archive/) | Historical migration plans and reviews (superseded) |
 
 

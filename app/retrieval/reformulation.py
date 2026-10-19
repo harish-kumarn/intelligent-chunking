@@ -15,6 +15,7 @@ Main path
 
 Failure policy: every step degrades to returning the original query (logged at
 WARNING/INFO with the stage) — reformulation must never block retrieval.
+Tracing: one `query_reformulation` trace per call (query fingerprint in, `reformulated` + status out).
 Concurrency: safe to share across threads; caches are guarded by a lock and
 nothing per-request is stored on the instance.
 """
@@ -30,6 +31,9 @@ from groq import Groq
 
 from app.config.defaults import ChunkerConfig
 from app.logging.setup import get_logger
+from app.observability.modules import ModuleName
+from app.observability.sanitize import query_fingerprint
+from app.observability.telemetry import get_telemetry
 from app.storage.s3_artifact_store import S3ArtifactStore
 
 __all__ = ["QueryReformulationService", "flatten_vocabulary"]
@@ -102,20 +106,35 @@ class QueryReformulationService:
     def reformulate(self, query: str, collection_name: str, *, s3_bucket: str, AWS_DEFAULT_REGION: Optional[str]) -> str:
         """Returns the rewritten query, or `query` unchanged when any step is unavailable. Never raises."""
         query = query.strip()
-        if self._groq is None:
-            return query
-        store = self._store(s3_bucket, AWS_DEFAULT_REGION)
-        vocabulary = self._collection_vocabulary(store, s3_bucket, collection_name)
-        if not vocabulary:
-            return query
+        telemetry = get_telemetry()
+        with telemetry.trace(
+            ModuleName.QUERY_REFORMULATION, input=telemetry.query_input(query), collection_name=collection_name, model=self._cfg.requery_model,
+        ) as trace:
+            if self._groq is None:
+                trace.set_output(reformulated=False, status="no_groq_key")
+                return query
+            store = self._store(s3_bucket, AWS_DEFAULT_REGION)
+            vocabulary = self._collection_vocabulary(store, s3_bucket, collection_name)
+            if not vocabulary:
+                trace.set_output(reformulated=False, status="no_vocabulary")
+                return query
 
-        try:
-            rewritten = self._rewrite(query, vocabulary)
-        except Exception as exc:
-            self._skip("rewrite", "failed", collection_name, error=exc)
-            return query
-        self._log.info("Query reformulated: collection=%s %r -> %r", collection_name, query, rewritten)
-        return rewritten or query
+            try:
+                rewritten = self._rewrite(query, vocabulary)
+            except Exception as exc:
+                self._skip("rewrite", "failed", collection_name, error=exc)
+                trace.record_error(exc)
+                trace.set_output(reformulated=False, status="rewrite_failed")
+                return query
+            rewritten = rewritten or query
+            # Query text stays out of INFO logs and traces by default (customer data): fingerprints correlate runs.
+            self._log.info(
+                "Query reformulated: collection=%s %s -> %s", collection_name,
+                query_fingerprint(query)["query_sha256_12"], query_fingerprint(rewritten)["query_sha256_12"],
+            )
+            self._log.debug("Reformulated query text: %r -> %r", query, rewritten)
+            trace.set_output(reformulated=rewritten != query, status="completed", **query_fingerprint(rewritten))
+            return rewritten
 
     # ------------------------------------------------------------------ #
     # Internals

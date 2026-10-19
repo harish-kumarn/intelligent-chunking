@@ -28,6 +28,7 @@ from app.api.errors import http_error
 from app.api.routes.documents import _language_or_400, document_id_for, document_response, receive_upload
 from app.api.schemas import CollectionName, ErrorDetail, ErrorResponse, IngestionJobResponse
 from app.config.settings import ServerSettings
+from app.observability.context import current_execution
 from app.orchestration.errors import ChannelError
 from app.orchestration.jobs import IngestionJob, IngestionJobManager, IngestionRequest, JobConflictError, ServerBusyError
 from app.orchestration.orchestrator import ChannelOrchestrator
@@ -66,6 +67,7 @@ async def create_ingestion_job(
         document_id=document_id, filename=filename, content_hash=staged.sha256, collection_name=collection_name,
         autogrounding=autogrounding, language=document_language,
         classification=classification, s3_bucket=s3_bucket, AWS_DEFAULT_REGION=AWS_DEFAULT_REGION, replace=replace,
+        execution=current_execution().to_dict(),  # the X-Execution-* headers travel with the job (and its restart)
     )
     try:
         job, created = await run_in_threadpool(jobs.submit, orchestrator, request, staged.path)  # validation opens the PDF
@@ -111,4 +113,6 @@ def job_response(job: IngestionJob, *, debug: bool) -> IngestionJobResponse:
         finished_at=job.finished_at,
         result=document_response(job.document_id, job.result, debug=debug) if job.result is not None else None,
         error=ErrorDetail(code=job.error_code, message=job.error_message or "", retryable=job.retryable) if job.error_code else None,
+        execution_id=job.execution_id,
+        trace_ids=list(job.trace_ids),
     )

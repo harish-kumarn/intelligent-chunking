@@ -12,6 +12,9 @@ Main path
     generate_page ─► build prompt ─► generate (retry w/ back-off) ─► parse+validate ─► record tokens
     chunk_page    ─► generate_page ─► store
 
+Each page is one `chunk_page` generation in the caller's trace (model, token usage summed over attempts,
+retry count, chunk count — never the prompt, the image or the output).
+
 Cache lifecycle (a long document outlives any fixed TTL: ~20 s per page, so ~170 pages per hour)
     acquire : reuse a live cache whose display name carries the hash of model + system prompt (so a
               changed prompt never reuses a stale cache), else create one
@@ -48,6 +51,8 @@ from app.chunking.store import ChunkStore
 from app.chunking.token_monitor import TokenUsageMonitor
 from app.config.defaults import ChunkerConfig
 from app.logging.setup import get_logger
+from app.observability.modules import SpanName
+from app.observability.telemetry import get_telemetry
 from app.utils.gemini import gemini_client
 from app.utils.json_utils import repair_and_parse_json
 
@@ -99,6 +104,11 @@ class IntelligentPDFChunker:
         self._cache_expires = datetime.min.replace(tzinfo=timezone.utc)
         self._acquire_cache()
         self._log.info("Chunker ready: model=%s cache=%s", config.chunking_model, self._cache_name)
+
+    @property
+    def prompt_fingerprint(self) -> str:
+        """Hash of model + system prompt (the cache display-name suffix): names the prompt a trace was produced with."""
+        return self._cache_display_name[len(_CACHE_DISPLAY_PREFIX):]
 
     # ------------------------------------------------------------------ #
     # System-prompt cache
@@ -196,20 +206,32 @@ class IntelligentPDFChunker:
         image_bytes = page.page_image_path.read_bytes()
         retries = self._cfg.chunking_max_retries
 
-        for attempt in range(1, retries + 1):
-            cache_name = self._cache_name
-            try:
-                self._refresh_cache()
+        # One generation per page, retries folded in: usage summed over attempts, `retry_count` recorded.
+        with get_telemetry().generation(
+            SpanName.CHUNK_PAGE, model=self._cfg.chunking_model, page_number=page.page_number, prompt_fingerprint=self.prompt_fingerprint,
+        ) as generation:
+            usage_total: dict[str, int] = {}
+            for attempt in range(1, retries + 1):
                 cache_name = self._cache_name
-                return self._generate(prompt, image_bytes, page.page_number, attempt, cache_name), attempt
-            except Exception as exc:
-                self._log.warning("Page %d attempt %d/%d failed: %s", page.page_number, attempt, retries, exc)
-                if attempt == retries or not _is_retryable(exc):
-                    raise
-                if _cache_gone(exc):  # expired or deleted under us: a new cache, then retry at once
-                    self._replace_cache(cache_name)
+                try:
+                    self._refresh_cache()
+                    cache_name = self._cache_name
+                    response, usage = self._generate(prompt, image_bytes, page.page_number, attempt, cache_name)
+                except Exception as exc:
+                    self._log.warning("Page %d attempt %d/%d failed: %s", page.page_number, attempt, retries, exc)
+                    if attempt == retries or not _is_retryable(exc):
+                        generation.set(retry_count=attempt - 1)
+                        raise
+                    if _cache_gone(exc):  # expired or deleted under us: a new cache, then retry at once
+                        self._replace_cache(cache_name)
+                        continue
+                    time.sleep(self._backoff(attempt))
                     continue
-                time.sleep(self._backoff(attempt))
+                for key, value in usage.items():
+                    usage_total[key] = usage_total.get(key, 0) + value
+                generation.set(retry_count=attempt - 1, chunk_count=len(response.chunks))
+                generation.set_usage(**usage_total)
+                return response, attempt
 
         raise RuntimeError(f"chunk_page exhausted retries for page {page.page_number}")  # unreachable
 
@@ -219,8 +241,8 @@ class IntelligentPDFChunker:
             if self._cache_name == gone:
                 self._create_cache()
 
-    def _generate(self, prompt: str, image_bytes: bytes, page_number: int, attempt: int, cache_name: str) -> ChunkingResponse:
-        """One Gemini call — errors propagate to the retry loop."""
+    def _generate(self, prompt: str, image_bytes: bytes, page_number: int, attempt: int, cache_name: str) -> tuple[ChunkingResponse, dict[str, int]]:
+        """One Gemini call — errors propagate to the retry loop. Returns the response and its token usage."""
         result = self._client.models.generate_content(
             model=self._cfg.chunking_model,
             contents=[
@@ -235,18 +257,27 @@ class IntelligentPDFChunker:
                 temperature=self._cfg.chunking_temperature,
             ),
         )
-        self._record_usage(result.usage_metadata, page_number, attempt)
-        return ChunkingResponse.model_validate(repair_and_parse_json(result.text or ""))
+        usage = self._record_usage(result.usage_metadata, page_number, attempt)
+        return ChunkingResponse.model_validate(repair_and_parse_json(result.text or "")), usage
 
-    def _record_usage(self, usage: Any, page_number: int, attempt: int) -> None:
+    def _record_usage(self, usage: Any, page_number: int, attempt: int) -> dict[str, int]:
+        prompt_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        candidate_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+        thinking_tokens = getattr(usage, "thoughts_token_count", 0) or 0
         self._tokens.record(
             page_number=page_number,
             attempt=attempt,
-            prompt_tokens=getattr(usage, "prompt_token_count", 0) or 0,
-            candidate_tokens=getattr(usage, "candidates_token_count", 0) or 0,
-            cached_tokens=getattr(usage, "cached_content_token_count", 0) or 0,
-            thinking_tokens=getattr(usage, "thoughts_token_count", 0) or 0,
+            prompt_tokens=prompt_tokens,
+            candidate_tokens=candidate_tokens,
+            cached_tokens=cached_tokens,
+            thinking_tokens=thinking_tokens,
         )
+        # Langfuse usage_details: `input` / `output` / `total` are its standard keys, the rest are detail buckets.
+        return {
+            "input": prompt_tokens, "output": candidate_tokens + thinking_tokens, "total": prompt_tokens + candidate_tokens + thinking_tokens,
+            "input_cached_tokens": cached_tokens, "output_reasoning_tokens": thinking_tokens,
+        }
 
     def _backoff(self, attempt: int) -> float:
         wait = min(self._cfg.chunking_retry_delay * (2 ** (attempt - 1)), self._cfg.chunking_timeout)

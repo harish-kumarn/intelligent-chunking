@@ -3,7 +3,8 @@ app.api.uploads
 ===============
 `stage_upload` — stream an uploaded file to disk, never holding it in memory.
 
-    stream : 1 MiB reads into `<workspace root>/_uploads/<uuid>.pdf`, hashing (SHA-256) as it goes
+    stream : 1 MiB reads into `<workspace root>/_uploads/<uuid><suffix>` (`.pdf`; `.csv` for datasets),
+             hashing (SHA-256) as it goes
     limit  : the upload is rejected the moment it passes `max_bytes`, not after it was read whole
 
 The staged file is handed to the channel, which moves it into the document's workspace
@@ -38,10 +39,10 @@ class StagedUpload:
         self.path.unlink(missing_ok=True)
 
 
-def stage_upload(stream: BinaryIO, filename: str, directory: Path, max_bytes: int) -> StagedUpload:
+def stage_upload(stream: BinaryIO, filename: str, directory: Path, max_bytes: int, *, suffix: str = ".pdf") -> StagedUpload:
     """Copy `stream` to a new file in `directory`. Raises InvalidDocumentError when it exceeds `max_bytes`."""
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{uuid.uuid4().hex}.pdf"
+    path = directory / f"{uuid.uuid4().hex}{suffix}"
     digest = hashlib.sha256()
     size = 0
     try:

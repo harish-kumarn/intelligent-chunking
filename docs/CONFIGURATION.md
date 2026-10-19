@@ -74,8 +74,18 @@ name), same fail-loud policy. Nothing downstream of stage 1 can tell which one r
 | `INGEST_JOB_AUTO_RESUME` | `true` | at startup, continue the job a restart interrupted |
 | `S3_UPLOAD_ENABLED` | `false` | publish each ingestion's artifact directory to S3 |
 | `S3_BUCKET` / `AWS_DEFAULT_REGION` | unset | defaults when a request does not name a bucket/region |
+| `S3_DATASET_BUCKET` | `S3_BUCKET` | bucket of the ground-truth datasets (`_datasets/…`, [DATASETS.md](DATASETS.md)) |
+| `MAX_DATASET_UPLOAD_BYTES` / `MAX_DATASET_ROWS` | 25 MiB / `50000` | dataset CSV limits (413 / 422 `TOO_MANY_ROWS`) |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | static credentials for S3, read from `.env` or the environment; blank → boto3's standard chain (profile, IAM role) |
 | `AWS_SESSION_TOKEN` / `AWS_DEFAULT_REGION` | unset | optional STS token; region fallback when `AWS_DEFAULT_REGION` is unset |
+| `S3_CONNECT_TIMEOUT_SECONDS` / `S3_READ_TIMEOUT_SECONDS` / `S3_MAX_ATTEMPTS` | `10` / `60` / `5` | every boto3 S3 client (`app/storage/s3_client.py`, botocore "standard" retry mode) — read by `S3ClientOptions` in `app/config/aws.py` |
+| `LANGFUSE_ENABLED` | `false` | Langfuse tracing ([OBSERVABILITY.md](OBSERVABILITY.md)); `true` without both keys fails at startup |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | unset | project keys; the secret is a `SecretStr` (never logged) |
+| `LANGFUSE_HOST` / `LANGFUSE_BASE_URL` | SDK default (Cloud) | base URL (self-hosted / EU / `http://localhost:3000` for local Docker); either name is read |
+| `LANGFUSE_TIMEOUT` / `LANGFUSE_SAMPLE_RATE` | `5` s / `1.0` | export timeout per batch (bounds the shutdown flush); fraction of traces kept |
+| `LANGFUSE_CAPTURE_QUERY_TEXT` | `false` | record query text in retrieval traces (default: sha256 fingerprint + length) |
+| `LANGFUSE_DATASET_SYNC_MAX_ITEMS` | `5000` | rows above this are not mirrored into Langfuse Datasets |
+| `PIPELINE_VERSION` | service version | `version` stamped on every trace |
 | `MAX_UPLOAD_SIZE_BYTES` | `209715200` (200 MiB) | rejected with 400 above this — while streaming, before the body is read whole |
 | `MAX_PDF_PAGES` | `2000` | PDFs with more pages are rejected with 400 before any paid stage |
 | `LOG_LEVEL` | `INFO` | |
@@ -191,6 +201,14 @@ its manifest); changing these affects collections created afterwards. See
 
 `IC_RESOURCES_BASE` (`ic_resources`) — root for `<document_id>/` artifact folders when `IngestPipeline` is used
 directly. The PDF channel overrides it per run with the document's workspace.
+
+### Configuration fingerprint
+
+`ChunkerConfig.fingerprint_fields()` returns the behaviour-affecting, non-secret fields (OCR engine and models,
+chunking / classification / auto-grounding models and tuning, embedding and rerank models, Milvus index defaults).
+Together with the default `RetrievalConfig` and the prompt files they form the `config_fingerprint` every trace
+carries ([OBSERVABILITY.md §3](OBSERVABILITY.md#3-what-a-trace-carries)). Add a field there when it changes what
+the pipeline produces.
 
 ## RetrievalConfig (`app/retrieval/config.py`)
 

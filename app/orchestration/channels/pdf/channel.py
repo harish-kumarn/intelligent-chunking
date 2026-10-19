@@ -23,6 +23,9 @@ Main path
     validate ─► admit (prune stale; reset or reuse the workspace; move the PDF in; write the marker)
              ─► process: [identity check] ─► IngestPipeline.run ─► [S3 upload → publish → retention → register] ─► remove workspace (production, success)
 
+`process` is one `document_ingestion` trace (app.observability): the pipeline's stages are its child spans,
+the S3 publication its `s3_publish` span; its output records page / chunk counts and the language.
+
 The PDF is moved in only when the workspace does not hold it yet: replacing it would make every
 artifact look older than the PDF and the resume would redo all of them. The marker is written
 after the PDF, so a marker always vouches for a complete PDF.
@@ -46,8 +49,10 @@ from app.config.defaults import ChunkerConfig
 from app.config.settings import ServerSettings
 from app.ingestion.pipeline import IngestPipeline, IngestResult, ProgressCallback
 from app.logging.setup import get_logger
+from app.observability.modules import ModuleName, SpanName
+from app.observability.telemetry import get_telemetry
 from app.orchestration.errors import DocumentIdConflictError, InvalidDocumentError
-from app.storage.s3_artifact_store import S3ArtifactStore, register_in_collection
+from app.storage.s3_artifact_store import PublishResult, S3ArtifactStore, register_in_collection
 from app.utils.fs import atomic_write_text, move_file
 
 __all__ = ["PDFChannel"]
@@ -115,30 +120,42 @@ class PDFChannel:
         on_progress: Optional[ProgressCallback] = None,
     ) -> IngestResult:
         store = self._resolve_store(s3_bucket, AWS_DEFAULT_REGION)  # validated before any work starts
-        if store is not None and not replace:
-            _check_identity(store, document_id, content_hash)
         progress: ProgressCallback = on_progress or (lambda stage, done, total: None)
         workspace = Path(source).parent
         pipeline = IngestPipeline(self._base_config.model_copy(update={"resources_base": str(workspace)}), self._log)
-        try:
-            result = pipeline.run(
-                Path(source),
-                collection_name=collection_name,
-                autogrounding=autogrounding,
-                language=language,
-                classification=classification,
-                on_progress=progress,
+        telemetry = get_telemetry()
+        with telemetry.trace(
+            ModuleName.DOCUMENT_INGESTION, document_id=document_id, collection_name=collection_name, content_hash=content_hash,
+            language_hint=language, classification=classification, autogrounding=autogrounding, replace=replace,
+            ocr_technique=self._base_config.ocr_technique, chunking_model=self._base_config.chunking_model,
+        ) as trace:
+            if store is not None and not replace:
+                _check_identity(store, document_id, content_hash)
+            try:
+                result = pipeline.run(
+                    Path(source),
+                    collection_name=collection_name,
+                    autogrounding=autogrounding,
+                    language=language,
+                    classification=classification,
+                    on_progress=progress,
+                )
+                if store is not None:
+                    progress("publish", 0, 1)
+                    with telemetry.span(SpanName.S3_PUBLISH, version=content_hash) as span:
+                        published = self._publish(store, Path(result.base_dir), document_id, content_hash)
+                        span.set_output(uploaded_files=published.uploaded_file_count, already_existed=published.already_existed)
+                    if result.collection_name:
+                        register_in_collection(store, result.collection_name, document_id, language=result.language, logger=self._log)
+                    progress("publish", 1, 1)
+            except BaseException:
+                if not self._settings.debug:
+                    self._log.warning("Ingestion failed; workspace kept for a resume: %s", workspace)
+                raise
+            trace.set_output(
+                status="completed", page_count=result.page_count, chunk_count=result.chunk_count, language=result.language,
+                uploaded_to_milvus=result.uploaded, classified=result.classification_path is not None,
             )
-            if store is not None:
-                progress("publish", 0, 1)
-                self._publish(store, Path(result.base_dir), document_id, content_hash)
-                if result.collection_name:
-                    register_in_collection(store, result.collection_name, document_id, language=result.language, logger=self._log)
-                progress("publish", 1, 1)
-        except BaseException:
-            if not self._settings.debug:
-                self._log.warning("Ingestion failed; workspace kept for a resume: %s", workspace)
-            raise
         if not self._settings.debug:
             shutil.rmtree(workspace, ignore_errors=True)  # a finished document leaves nothing on local disk
         return result
@@ -201,10 +218,11 @@ class PDFChannel:
             except OSError as exc:  # best effort; the next run tries again
                 self._log.warning("Could not prune workspace %s: %s", entry, exc)
 
-    def _publish(self, store: S3ArtifactStore, artifact_dir: Path, document_id: str, content_hash: str) -> None:
-        store.upload_artifacts(artifact_dir, document_id=document_id, content_hash=content_hash)
+    def _publish(self, store: S3ArtifactStore, artifact_dir: Path, document_id: str, content_hash: str) -> PublishResult:
+        published = store.upload_artifacts(artifact_dir, document_id=document_id, content_hash=content_hash)
         store.publish_version(document_id=document_id, content_hash=content_hash)
         store.cleanup_old_versions(document_id=document_id, current_hash=content_hash)
+        return published
 
 
 def _check_identity(store: S3ArtifactStore, document_id: str, content_hash: str) -> None:

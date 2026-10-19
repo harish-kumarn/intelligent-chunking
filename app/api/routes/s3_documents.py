@@ -5,7 +5,9 @@ Work on a document whose artifacts are already published to S3, skipping OCR and
 
     POST /v1/documents/from-s3               : index the current version's merged chunks into Milvus
     POST /v1/documents/from-s3/autogrounding : auto-grounding alone; groundtruth_dataset.{json,csv}
-                                               saved into the same S3 version (and its manifest)
+                                               saved into the same S3 version (and its manifest); with
+                                               `publish_dataset`, the CSV also becomes a `hybrid_retrieval`
+                                               dataset version (docs/DATASETS.md)
 
     validate ─► acquire gate (429 if busy) ─► S3DocumentImporter / S3DocumentGrounder on a worker thread ─► response
 
@@ -30,19 +32,21 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.dependencies import get_base_config, get_gate, get_logger, get_settings
 from app.api.errors import http_error
+from app.api.routes.datasets import dataset_http_error, dataset_service, dataset_summary
 from app.api.routes.documents import _language_or_400
 from app.api.schemas import (
     ErrorResponse,
     S3DocumentImportRequest,
     S3DocumentImportResponse,
     S3DocumentRequest,
+    S3GroundingRequest,
     S3GroundingResponse,
 )
 from app.concurrency import ProcessingGate
 from app.config.defaults import ChunkerConfig
 from app.config.settings import ServerSettings
 from app.logging.setup import document_id_var, request_id_var
-from app.orchestration.errors import S3DocumentNotFoundError
+from app.orchestration.errors import ChannelError, S3DocumentNotFoundError
 from app.orchestration.s3_grounding import S3DocumentGrounder, S3GroundingResult
 from app.orchestration.s3_import import S3DocumentImporter, S3ImportResult
 from app.retrieval.errors import RetrievalError
@@ -89,15 +93,24 @@ async def import_document_from_s3(
 
 @router.post("/v1/documents/from-s3/autogrounding", response_model=S3GroundingResponse, responses=_ERROR_RESPONSES)
 async def ground_document_from_s3(
-    request: S3DocumentRequest,
+    request: S3GroundingRequest,
     base_config: ChunkerConfig = Depends(get_base_config),
     gate: ProcessingGate = Depends(get_gate),
     settings: ServerSettings = Depends(get_settings),
     logger: logging.LoggerAdapter = Depends(get_logger),
 ) -> S3GroundingResponse:
     document_id = request.folder_name
-    grounder = S3DocumentGrounder(_store(request, settings), base_config, logger)
-    result: S3GroundingResult = await _run_gated("s3_grounding", document_id, gate, logger, lambda: grounder.ground_document(document_id))
+    datasets = None
+    if request.publish_dataset:
+        datasets = dataset_service(settings, logger, s3_bucket=request.s3_bucket, region=request.AWS_DEFAULT_REGION)
+    grounder = S3DocumentGrounder(_store(request, settings), base_config, logger, dataset_service=datasets)
+    result: S3GroundingResult = await _run_gated(
+        "s3_grounding", document_id, gate, logger,
+        lambda: grounder.ground_document(
+            document_id, publish_dataset=request.publish_dataset, dataset_name=request.dataset_name, promote=request.promote,
+            sync_langfuse=request.sync_langfuse,
+        ),
+    )
     return S3GroundingResponse(
         document_id=result.document_id,
         status="completed",
@@ -107,6 +120,7 @@ async def ground_document_from_s3(
         question_count=result.question_count,
         failed_pages=result.failed_pages,
         artifacts=result.artifacts,
+        dataset=dataset_summary(result.dataset) if result.dataset is not None else None,
     )
 
 
@@ -122,7 +136,7 @@ def _store(request: S3DocumentRequest, settings: ServerSettings) -> S3ArtifactSt
 async def _run_gated(channel: str, document_id: str, gate: ProcessingGate, logger: logging.LoggerAdapter, work: Callable[[], T]) -> T:
     """Run `work` on a worker thread behind the gate, mapping failures to the API's error bodies."""
     log_extra: dict[str, Any] = {"channel": channel}
-    tokens = (request_id_var.set(uuid.uuid4().hex), document_id_var.set(document_id))
+    tokens = (request_id_var.set(request_id_var.get() or uuid.uuid4().hex), document_id_var.set(document_id))  # id from the middleware
     try:
         if not gate.try_acquire():
             logger.warning("%s rejected: server busy", channel, extra={**log_extra, "stage": "admission", "status": "rejected"})
@@ -135,10 +149,17 @@ async def _run_gated(channel: str, document_id: str, gate: ProcessingGate, logge
         except S3DocumentNotFoundError as exc:
             logger.warning("%s rejected: %s", channel, exc, extra={**log_extra, "stage": "resolve", "status": "failed"})
             raise http_error(404, exc.code, str(exc)) from exc
+        except ChannelError as exc:  # e.g. a dataset name that cannot be derived from the document id
+            logger.warning("%s rejected: %s", channel, exc, extra={**log_extra, "stage": "validation", "status": "failed"})
+            raise http_error(exc.http_status, exc.code, str(exc)) from exc
         except RetrievalError as exc:
             logger.warning("%s rejected: %s", channel, exc, extra={**log_extra, "stage": "index_check", "status": "failed"})
             raise http_error(409, exc.code, str(exc)) from exc
         except Exception as exc:
+            mapped = dataset_http_error(exc)  # dataset publication after grounding: 409 / 422 / 502 with their own codes
+            if mapped is not None:
+                logger.warning("%s dataset step failed: %s", channel, exc, extra={**log_extra, "stage": "dataset", "status": "failed"})
+                raise mapped from exc
             logger.error(
                 "%s failed", channel,
                 extra={**log_extra, "stage": "processing", "status": "failed", "error_type": type(exc).__name__, "error_message": str(exc)},
