@@ -1,5 +1,5 @@
 """
-app.logging.setup
+app.app_logging.setup
 =================
 One application logger, two renderings.
 

@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 from app.datasets.langfuse_sync import SyncResult, sync_dataset_version
 from app.datasets.schema import DatasetSchema, schema_for
 from app.datasets.validation import DatasetValidationError, ValidatedDataset, ValidationIssue, validate_csv
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.observability.modules import ModuleName, SpanName
 from app.observability.telemetry import Telemetry, get_telemetry
 from app.storage.s3_dataset_store import DatasetNotFoundError, S3DatasetStore, dataset_version_for

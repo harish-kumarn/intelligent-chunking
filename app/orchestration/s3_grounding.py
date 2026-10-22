@@ -38,7 +38,7 @@ from typing import List, Optional
 from app.config.defaults import ChunkerConfig
 from app.datasets.service import DatasetPublication, DatasetService
 from app.groundtruth.autogrounding import AutoGrounder
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.observability.modules import ModuleName
 from app.observability.telemetry import get_telemetry
 from app.orchestration.errors import InvalidDocumentError

@@ -24,7 +24,7 @@ from app.api.schemas import (
     RetrievalQueryResponse,
 )
 from app.config.settings import ServerSettings
-from app.logging.setup import request_id_var
+from app.app_logging.setup import request_id_var
 from app.retrieval.errors import CollectionNotFoundError
 from app.retrieval.filters import CategoryFilter
 from app.retrieval.reformulation import QueryReformulationService

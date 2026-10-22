@@ -33,7 +33,7 @@ from typing import Callable, List, Optional
 import fitz  # PyMuPDF
 
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import in_context
+from app.app_logging.setup import in_context
 from app.utils.fs import atomic_write_text
 
 __all__ = ["OcrWindow", "plan_windows", "run_windowed", "shift_pages"]

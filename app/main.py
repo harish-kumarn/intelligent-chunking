@@ -34,7 +34,7 @@ from app.api.uploads import clear_staged_uploads
 from app.concurrency import ProcessingGate
 from app.config.defaults import ChunkerConfig
 from app.config.settings import ServerSettings
-from app.logging.setup import configure_logging, get_logger
+from app.app_logging.setup import configure_logging, get_logger
 from app.observability.telemetry import Telemetry, configure_telemetry, set_telemetry
 from app.observability.versioning import config_fingerprint
 from app.orchestration.channels.pdf.channel import PDFChannel

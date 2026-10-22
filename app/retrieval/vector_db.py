@@ -55,7 +55,7 @@ from langchain_core.documents import Document
 from pymilvus import AnnSearchRequest, MilvusClient, RRFRanker, WeightedRanker
 
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import in_context
+from app.app_logging.setup import in_context
 from app.observability.modules import ModuleName, SpanName
 from app.observability.sanitize import query_fingerprint
 from app.observability.telemetry import get_telemetry
@@ -667,5 +667,5 @@ def _resolve_logger(logger: Optional[logging.Logger]) -> logging.LoggerAdapter:
         return logger
     if logger is not None:
         return logging.LoggerAdapter(logger, {"log_module": "RETRIEVER"})
-    from app.logging.setup import get_logger
+    from app.app_logging.setup import get_logger
     return get_logger(module="RETRIEVER")

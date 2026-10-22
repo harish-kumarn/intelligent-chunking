@@ -2,7 +2,7 @@
 app.observability
 =================
 Module identity, execution context and the Langfuse-backed tracing facade. A leaf package next to
-`app.logging` (it imports nothing else from `app`), so every layer may use it.
+`app.app_logging` (it imports nothing else from `app`), so every layer may use it.
 
     modules    : ModuleName / SpanName / ExecutionKind — the only names a trace may carry
     context    : ExecutionContext (+ header parsing) carried in a context variable across threads

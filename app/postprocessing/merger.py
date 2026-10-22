@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 from app.chunking.schema import ChunkRecord
 from app.chunking.store import ChunkStore
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.utils.fs import atomic_write_json
 
 __all__ = ["MergedChunk", "load_merged_chunks", "merge_chunks", "merge_file", "save_merged_chunks"]

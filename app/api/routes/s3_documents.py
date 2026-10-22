@@ -45,7 +45,7 @@ from app.api.schemas import (
 from app.concurrency import ProcessingGate
 from app.config.defaults import ChunkerConfig
 from app.config.settings import ServerSettings
-from app.logging.setup import document_id_var, request_id_var
+from app.app_logging.setup import document_id_var, request_id_var
 from app.orchestration.errors import ChannelError, S3DocumentNotFoundError
 from app.orchestration.s3_grounding import S3DocumentGrounder, S3GroundingResult
 from app.orchestration.s3_import import S3DocumentImporter, S3ImportResult

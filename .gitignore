@@ -36,3 +36,9 @@ requirements-dev.txt
 backup/
 evaluation/.cache/
 ingest_workspace/
+
+.venv_MIC
+ic_logs/
+ic_resources/
+groundtruth_dataset.json
+.pdf

@@ -31,7 +31,7 @@ from google.genai import types as genai_types
 from app.classification.memory import CategoryMemory, Resolution
 from app.classification.schema import ClassificationBatchResponse, ClassificationResponse
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.utils.gemini import gemini_client
 from app.utils.json_utils import repair_and_parse_json
 

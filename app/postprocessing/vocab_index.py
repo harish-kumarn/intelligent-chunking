@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.postprocessing.merger import MergedChunk, load_merged_chunks
 from app.utils.fs import atomic_write_json
 

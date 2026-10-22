@@ -59,7 +59,7 @@ from app.groundtruth.autogrounding import AutoGrounder
 from app.ingestion.document_parser import md_to_page_json
 from app.ingestion.errors import IncompleteStageError, NoContentError
 from app.ingestion.ocr import run_ocr
-from app.logging.setup import get_logger, in_context
+from app.app_logging.setup import get_logger, in_context
 from app.observability.modules import SpanName
 from app.observability.telemetry import get_telemetry
 from app.postprocessing.merger import MergedChunk, merge_file
@@ -151,7 +151,7 @@ class IngestPipeline:
         pdf_path: Path,
         *,
         collection_name: Optional[str] = None,
-        autogrounding: bool = False,
+        autogrounding: bool = True,
         language: Optional[str] = None,
         classification: Optional[bool] = None,
         on_progress: Optional[ProgressCallback] = None,
@@ -486,3 +486,18 @@ def _page_numbers(pages: Dict[str, str]) -> List[int]:
 def _is_fresh(artifact: Path, source: Path) -> bool:
     """True when `artifact` exists, is non-empty, and is at least as new as `source`."""
     return artifact.exists() and artifact.stat().st_size > 0 and artifact.stat().st_mtime >= source.stat().st_mtime
+
+def main() -> None:
+    from app.app_logging.setup import configure_logging
+
+    configure_logging("ingest-cli", "development", level="INFO", log_dir="logs")
+    pipeline = IngestPipeline()
+    result = pipeline.run(
+        Path("test1.pdf"),
+        autogrounding=True,
+        on_progress=lambda stage, done, total: print(f"[{stage}] {done}/{total}"),
+    )
+    print(result)
+
+if __name__ == "__main__":
+    main()
