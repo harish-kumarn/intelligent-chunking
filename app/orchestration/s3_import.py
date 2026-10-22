@@ -34,7 +34,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config.defaults import ChunkerConfig
 from app.ingestion.pipeline import index_merged_chunks, resolve_document_language
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.observability.modules import ModuleName
 from app.observability.telemetry import get_telemetry
 from app.orchestration.errors import S3DocumentNotFoundError

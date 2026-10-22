@@ -35,7 +35,7 @@ import fitz  # PyMuPDF
 
 from app.config.defaults import ChunkerConfig
 from app.ingestion.ocr.errors import OCRConfigurationError, OCRResultError
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 
 __all__ = ["OCRConfigurationError", "OCRResultError", "is_retryable_ocr_error", "run_ocr", "with_retries"]
 

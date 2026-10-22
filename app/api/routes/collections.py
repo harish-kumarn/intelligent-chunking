@@ -26,7 +26,7 @@ from app.api.schemas import CollectionDeleteResponse, CollectionListResponse, Co
 from app.concurrency import ProcessingGate
 from app.config.defaults import ChunkerConfig
 from app.config.settings import ServerSettings
-from app.logging.setup import request_id_var
+from app.app_logging.setup import request_id_var
 from app.retrieval.registry import RetrieverRegistry
 from app.retrieval.vector_db import milvus_connection_args
 from app.storage.s3_artifact_store import S3ArtifactStore

@@ -16,7 +16,7 @@ Telemetry — the one tracing facade of the service, backed by Langfuse (OpenTel
                             text when `capture_query_text` is on (an explicit, off-by-default switch)
 
 Parent/child correlation rides on contextvars (OpenTelemetry's current span): a thread pool task bound
-with `app.logging.setup.in_context` — or an executor call wrapped the same way — keeps its parent.
+with `app.app_logging.setup.in_context` — or an executor call wrapped the same way — keeps its parent.
 
 Failure policy: secondary path, always. The default `Telemetry` is a no-op (tests, scripts, the
 evaluation harness, `LANGFUSE_ENABLED=false`). `LangfuseTelemetry` guards every SDK call: an exception
@@ -32,7 +32,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, Optional
 
-from app.logging.setup import get_logger, request_id_var
+from app.app_logging.setup import get_logger, request_id_var
 from app.observability.context import current_execution, trace_ids_var
 from app.observability.modules import ModuleName, SpanName
 from app.observability.sanitize import classify_error, query_fingerprint, sanitize_metadata

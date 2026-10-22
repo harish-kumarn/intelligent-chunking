@@ -50,7 +50,7 @@ from app.chunking.schema import ChunkingInput, ChunkingResponse
 from app.chunking.store import ChunkStore
 from app.chunking.token_monitor import TokenUsageMonitor
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.observability.modules import SpanName
 from app.observability.telemetry import get_telemetry
 from app.utils.gemini import gemini_client

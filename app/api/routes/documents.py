@@ -38,7 +38,7 @@ from app.concurrency import ProcessingGate
 from app.config.settings import ServerSettings
 from app.ingestion.errors import NoContentError
 from app.ingestion.pipeline import IngestResult
-from app.logging.setup import document_id_var, request_id_var
+from app.app_logging.setup import document_id_var, request_id_var
 from app.orchestration.errors import ChannelError
 from app.orchestration.orchestrator import ChannelOrchestrator
 from app.retrieval.errors import RetrievalError

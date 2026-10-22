@@ -30,7 +30,7 @@ from typing import Any, Dict, Optional, Tuple
 from groq import Groq
 
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.observability.modules import ModuleName
 from app.observability.sanitize import query_fingerprint
 from app.observability.telemetry import get_telemetry

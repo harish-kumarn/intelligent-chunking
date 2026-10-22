@@ -30,7 +30,7 @@ from azure.core.credentials import AzureKeyCredential
 
 from app.config.defaults import ChunkerConfig
 from app.ingestion.ocr.errors import OCRConfigurationError, OCRResultError
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.utils.fs import atomic_write_text
 
 __all__ = ["run_azure_ocr"]

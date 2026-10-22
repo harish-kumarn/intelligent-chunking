@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable, Dict
 from starlette.datastructures import MutableHeaders
 from starlette.responses import JSONResponse
 
-from app.logging.setup import request_id_var
+from app.app_logging.setup import request_id_var
 from app.observability.context import InvalidExecutionHeader, execution_var, parse_execution_headers, trace_ids_var
 
 __all__ = ["REQUEST_ID_HEADER", "TRACE_ID_HEADER", "RequestContextMiddleware"]

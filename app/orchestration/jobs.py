@@ -55,7 +55,7 @@ from app.chunking.chunker import is_fatal_gemini_error
 from app.concurrency import ProcessingGate
 from app.ingestion.errors import NoContentError
 from app.ingestion.pipeline import STAGES, IngestResult
-from app.logging.setup import document_id_var, request_id_var
+from app.app_logging.setup import document_id_var, request_id_var
 from app.observability.context import ExecutionContext, execution_var, trace_ids_var
 from app.orchestration.errors import ChannelError
 from app.orchestration.orchestrator import ChannelOrchestrator

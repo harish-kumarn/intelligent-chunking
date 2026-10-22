@@ -48,7 +48,7 @@ import fitz  # PyMuPDF
 from app.config.defaults import ChunkerConfig
 from app.config.settings import ServerSettings
 from app.ingestion.pipeline import IngestPipeline, IngestResult, ProgressCallback
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.observability.modules import ModuleName, SpanName
 from app.observability.telemetry import get_telemetry
 from app.orchestration.errors import DocumentIdConflictError, InvalidDocumentError

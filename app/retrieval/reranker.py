@@ -20,7 +20,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import cohere
 
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.retrieval.cohere_retry import MAX_ATTEMPTS, RETRYABLE_EXCEPTIONS, backoff_seconds
 
 __all__ = ["CohereReranker"]

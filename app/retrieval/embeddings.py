@@ -18,7 +18,7 @@ from typing import Callable, List, Optional, TypeVar
 
 import cohere
 
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.retrieval.cohere_retry import MAX_ATTEMPTS, RETRYABLE_EXCEPTIONS, backoff_seconds
 
 __all__ = ["CohereEmbeddings"]

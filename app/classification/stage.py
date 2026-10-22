@@ -40,7 +40,7 @@ from app.classification.classifier import ChunkClassifier, prompt_chars
 from app.classification.memory import CategoryMemory, InvalidClassificationError, Resolution, chunk_fingerprint
 from app.classification.schema import F_MAIN_CATEGORY, F_SUB_CATEGORIES
 from app.config.defaults import ChunkerConfig
-from app.logging.setup import get_logger
+from app.app_logging.setup import get_logger
 from app.postprocessing.merger import MergedChunk, load_merged_chunks, save_merged_chunks
 
 __all__ = ["ClassificationResult", "ClassificationStage"]

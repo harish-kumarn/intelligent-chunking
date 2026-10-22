@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config.aws import AwsCredentials
-from app.logging.setup import get_logger, in_context
+from app.app_logging.setup import get_logger, in_context
 from app.storage.s3_client import build_s3_client
 
 __all__ = [
